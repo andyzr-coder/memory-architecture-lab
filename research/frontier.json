@@ -1,0 +1,1101 @@
+{
+  "modules": [
+    {
+      "id": "hbm",
+      "title": "HBM：把DRAM阵列、通道与先进封装接起来",
+      "group": "frontier",
+      "level": "core",
+      "minutes": 45,
+      "intro": "你已经理解GPU侧带宽需求，这一章补上另一半：HBM内部仍是DRAM阵列，带宽来自大量可调度的并行资源及宽接口，容量来自die密度与堆叠。不要把“层数、通道数、总线宽度、带宽”混为一个指标。",
+      "prerequisites": [
+        "dram-array",
+        "dram-timing",
+        "controller"
+      ],
+      "outcomes": [
+        "画出GPU到HBM cell的完整路径",
+        "分别计算每stack容量与峰值带宽",
+        "解释pseudo-channel、TSV和base die的不同职责",
+        "用热、良率、路由及利用率评价增加stack的方案"
+      ],
+      "sections": [
+        {
+          "id": "hbm-path",
+          "title": "01｜一笔GPU读请求到底经过什么",
+          "html": "<p>把路径拆成两段：<strong>GPU内部</strong>是SM发起load、合并访存、查缓存、进入memory partition/控制器；<strong>存储一侧</strong>是PHY与封装互连、HBM底部接口及垂直互连、目标通道中的bank、子阵列、感应放大器，最后回到数据总线。不同GPU会有不同的缓存分片和地址映射，不能认为“一个SM固定对应一个HBM stack”。</p><p>HBM的DRAM核心die仍保留字线、位线、cell、行缓冲和刷新。堆叠并没有取消ACT、PRE及行冲突，只是给系统提供更多并行服务路径。GPU内几千个线程可以提供大量未完成请求；控制器必须把它们分散到不同通道和bank，才有机会把这些路径用满。</p><p><strong>面试画图时标清边界：</strong>controller负责策略与时序约束，PHY负责物理收发；base die提供具体产品需要的接口、互连和辅助逻辑，不能一概写成“完整GPU内存控制器就在base die”。HBM4及定制base die扩大逻辑设计空间，也不意味着所有产品都内置通用CPU。<a href=\"https://www.micron.com/products/memory/hbm/hbm4\" target=\"_blank\" rel=\"noopener\">Micron HBM4</a></p>"
+        },
+        {
+          "id": "hbm-geometry",
+          "title": "02｜channel、pseudo-channel、bank、die不是同一种划分",
+          "html": "<p>用仓库类比：stack是一栋楼，die是楼层，channel是独立的服务线路，bank是能独立准备数据的工作区。<strong>逻辑服务线路和物理楼层不必一一对应</strong>，具体映射取决于器件组织。</p><table><thead><tr><th>概念</th><th>主要决定</th><th>常见误解</th></tr></thead><tbody><tr><td>DRAM die数量</td><td>总容量、堆叠高度、热与制造复杂度</td><td>12-high就等于12通道</td></tr><tr><td>channel/pseudo-channel</td><td>可调度请求流、数据接口分区</td><td>切成两份就凭空带宽翻倍</td></tr><tr><td>bank/subarray</td><td>激活及行缓冲并行性</td><td>有很多bank就无时序约束</td></tr><tr><td>TSV</td><td>穿过硅的垂直电连接</td><td>TSV自身就是存储单元</td></tr></tbody></table><p>以HBM3为明确例子：总数据宽度1024 bit，可分16个64-bit channel，进一步形成32个32-bit pseudo-channel。后者配合8拍burst提供32 B数据粒度。pseudo-channel增加调度分区，但仍有共享资源和命令时序；不要把它当作完全互不影响的芯片。<a href=\"https://www.synopsys.com/articles/hbm3-ip-dwtb.html\" target=\"_blank\" rel=\"noopener\">Synopsys HBM3通道说明</a></p>"
+        },
+        {
+          "id": "hbm-bandwidth",
+          "title": "03｜两条公式分清容量和带宽",
+          "html": "<pre>stack容量 = 每die容量 × DRAM die数量\n峰值数据带宽 = 数据引脚数 × 每引脚数据率 ÷ 8\n可用带宽 = 峰值带宽 × 综合利用率</pre><p>这里的数据率已经是Gb/s或GT/s口径时，<strong>不要再乘DDR的2</strong>。如果给的是时钟频率，才要按具体接口机制换成数据率。容量的Gb与GB也差8倍。</p><p><strong>教学假设：</strong>一个stack有12个24 Gb DRAM die，容量为12×24÷8=36 GB；1024个数据引脚、9.6 Gb/s每pin，峰值为1228.8 GB/s，即1.2288 TB/s。8个这样的stack得到288 GB和9.8304 TB/s峰值，但这是假设组合计算，不是某GPU产品宣称。若有效利用率70%，应用能用约6.88 TB/s；70%是本例假设，不能当通用常数。</p><p>作为真实产品锚点，Micron官方列出HBM3E的24GB 8-high及36GB 12-high产品，1024 I/O与超过1.2TB/s；HBM4官方页面则列2048 I/O及不同堆叠配置。产品值必须绑定厂商、型号/代际和日期，不能拿HBM3的channel数套HBM4。<a href=\"https://www.micron.com/products/memory/hbm/hbm3e\" target=\"_blank\" rel=\"noopener\">Micron HBM3E</a>；<a href=\"https://www.micron.com/products/memory/hbm/hbm4\" target=\"_blank\" rel=\"noopener\">Micron HBM4</a></p>"
+        },
+        {
+          "id": "hbm-package",
+          "title": "04｜为什么既叫3D堆叠又常用2.5D封装",
+          "html": "<p><strong>描述的层级不同。</strong>HBM stack内部把多片DRAM die垂直堆叠，是3D结构；GPU和多个HBM stack通常并排放在高密度互连之上，是系统层面的2.5D集成。把HBM直接放在GPU顶部则涉及另一类垂直集成，热路径和供电条件会改变。</p><p>TSMC CoWoS家族提供不同互连实现：CoWoS-S使用硅interposer，CoWoS-R使用RDL interposer，CoWoS-L结合RDL和局部硅互连。因此“HBM一定连接一整块相同结构的硅中介层”说得过死。<a href=\"https://3dfabric.tsmc.com/english/dedicatedFoundry/technology/cowos.htm\" target=\"_blank\" rel=\"noopener\">TSMC CoWoS结构</a></p><p>宽接口适合短而密的封装内走线。在同样带宽目标下，更多线可减轻单线速率压力，但会增加I/O面积、路由密度和封装约束。<strong>HBM的价值是一组协同取舍</strong>，不能简化成“单个DRAM cell读得快十倍”。比较GDDR或DDR时，需要把芯片/模组/整卡的总位宽和器件数拉到同一口径。</p>"
+        },
+        {
+          "id": "hbm-bottlenecks",
+          "title": "05｜高峰值为什么跑不满：从GPU一直问到cell",
+          "html": "<ol><li><strong>GPU没有足够独立请求：</strong>指针追踪、同步、低occupancy使内存级并行度不足，带宽还没用满就被延迟卡住。</li><li><strong>请求落点不均：</strong>stride或地址映射让少数channel/bank拥堵，空闲通道帮不上忙。</li><li><strong>粒度浪费：</strong>搬回32 B或更大系统事务，程序只使用其中少量字节；链路很忙而有效数据少。</li><li><strong>阵列准备不及时：</strong>row miss、PRE/ACT、刷新以及激活功率约束导致数据总线没有可发送数据。</li><li><strong>方向与队列切换：</strong>读写转换、QoS及返回网络阻塞影响利用率。</li></ol><p>因此调优要同时测<strong>应用有用字节、实际传输字节和时间</strong>。前者除时间是业务有效带宽，后者除时间是设备服务带宽；两者的差距能暴露访存放大。若增加SM后性能不变，先定位是哪一级饱和，而不是直接要求更快HBM。</p>"
+        },
+        {
+          "id": "hbm-yield",
+          "title": "06｜加高、加宽、加stack，哪个代价更大",
+          "html": "<p><strong>教学假设的良率直觉：</strong>若每个待组装die独立合格概率0.99，完全不筛选也无修复，12片全合格概率0.99^12≈88.6%，16片约85.1%。这只说明串联系统的风险会累积，<em>不是商业HBM良率估计</em>；实际有known-good-die筛选、冗余修复、TSV测试和工艺相关性。</p><p>加高可能提高容量而不同比例增加外部带宽，导致“每GB可用带宽”下降；加stack可提高容量和总接口带宽，却扩大封装面积、PHY占用及供电需求。提高pin速率可增加带宽，但眼图、时钟、信号完整性和功耗验证更紧。热设计还要考虑GPU热耦合、die间热阻和热点，并非看整包平均温度即可。</p><p><strong>架构回答模板：</strong>先问工作负载缺容量、缺带宽还是缺低延迟，再提出stack数/密度/速率组合；分别检查地址并行性、性能收益、每token能耗、封装可制造性和成本。一个“容量够、峰值大”的方案，仍可能因热点或利用率差输给更均衡的配置。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "HBM为什么带宽高，却不保证单次随机访问延迟同比降低？",
+          "answer": "带宽主要靠宽接口、短互连和多通道/bank并行；单个请求仍要经历排队、ACT/感应、列访问和返回。增多并行通道可以在同一时间服务更多请求，但不能消除同一个依赖链的等待。先看请求是否有足够并行度。",
+          "followups": [
+            "如果负载是链表遍历，加一倍HBM通道有什么作用？",
+            "应分别测idle latency还是loaded latency？"
+          ]
+        },
+        {
+          "q": "12-high HBM3E改16-high，带宽会增加4/3吗？",
+          "answer": "不能仅由层数推断。层数首先影响容量和热/制造；带宽看外部位宽、pin速率及内部组织是否改变。若接口不变，峰值带宽可以基本不变，新增容量反而降低带宽/容量比。",
+          "followups": [
+            "什么时候内部bank增加能提高可用带宽？",
+            "容量扩张后刷新开销如何评估？"
+          ]
+        },
+        {
+          "q": "32个pseudo-channel一定是32条完全独立总线吗？",
+          "answer": "是逻辑/接口上的细分服务资源，独立性要按相应代际规格的共享命令、时钟、电源及约束判断。它能增加请求调度灵活度，不等于每一条都无条件独立，也不改变总位宽守恒。",
+          "followups": [
+            "如何设计地址映射让顺序访问分散而保留row locality？"
+          ]
+        },
+        {
+          "q": "让你为GPU把HBM带宽提高一倍，你先做什么？",
+          "answer": "先跑代表性trace确认应用是否被HBM数据服务限制，拆分有用字节和实际传输量，检查channel负载与row hit率；再比较加stack、提高pin速率、提高利用率或降低流量。用端到端收益验证，随后闭合功耗、封装、热和成本预算。",
+          "followups": [
+            "若有50%运行时间完全不依赖内存，带宽翻倍的理想总加速比是多少？答案是1/(0.5+0.5/2)=1.33。"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "1024-bit接口、每pin 8Gb/s，峰值带宽是多少？",
+          "options": [
+            "1024GB/s",
+            "2048GB/s，因为DDR还要乘2",
+            "8192GB/s",
+            "只能由堆叠层数确定"
+          ],
+          "correct": 0,
+          "explanation": "1024×8Gb/s÷8=1024GB/s。给定的是pin数据率，DDR效应已包含。"
+        },
+        {
+          "q": "HBM stack内部3D堆叠、GPU与stack并排2.5D封装，这两句话是否矛盾？",
+          "options": [
+            "矛盾，2.5D中不能有3D组件",
+            "不矛盾，描述的是不同集成层级",
+            "只有HBM4可以同时成立"
+          ],
+          "correct": 1,
+          "explanation": "stack内部die垂直连接，与整个系统把GPU和stack并排互连，是两个层级。"
+        },
+        {
+          "q": "8个channel中只有1个忙，最先应调查什么？",
+          "options": [
+            "把存储单元容量加倍",
+            "地址映射、stride和请求分布",
+            "只测芯片最高温度"
+          ],
+          "correct": 1,
+          "explanation": "先确认瓶颈是否来自流量分布。热也重要，但不能解释所有通道失衡问题。"
+        }
+      ],
+      "sourceIds": [
+        "f01",
+        "f02",
+        "f03",
+        "f04"
+      ]
+    },
+    {
+      "id": "nand",
+      "title": "NAND基础：理解HBF前必须补齐的另一种阵列",
+      "group": "frontier",
+      "level": "core",
+      "minutes": 40,
+      "intro": "HBF的F是Flash。它不是把HBM的D改成F那么简单：cell读写物理机制、最小操作粒度、维护方法和软件契约都变了。先把普通NAND的因果链吃透，再判断高带宽Flash改进了什么、没改掉什么。",
+      "prerequisites": [
+        "dram-cell"
+      ],
+      "outcomes": [
+        "画出string/page/block/plane/die层级",
+        "解释读页、编程页、擦除块的不同机制",
+        "把FTL、ECC、GC、写放大与延迟联系起来",
+        "避免把3D NAND层数和封装die堆叠混为一谈"
+      ],
+      "sections": [
+        {
+          "id": "nand-cell",
+          "title": "01｜DRAM存电荷，NAND也存电荷，为什么行为完全不同",
+          "html": "<p>DRAM用电容上的电荷表示状态，访问晶体管接通后，与位线发生电荷共享，再由感应放大器恢复。NAND则将电荷保存在受绝缘结构约束的储电区域，<strong>用阈值电压变化</strong>来区分状态；浮栅和charge-trap是不同实现，不应把所有NAND都叫浮栅。读出时判断给定栅压下是否导通。<a href=\"https://www.kioxia.com/en-jp/rd/technology/nand-flash.html\" target=\"_blank\" rel=\"noopener\">KIOXIA NAND原理</a></p><p>想象DRAM是需要不断补水的小水杯，NAND是用能垒困住电荷的状态标记。这个类比只解释保持机制：NAND写/擦需要改变被困电荷，过程慢且会造成老化；读又要辨认阈值分布。因此<strong>掉电保留、读写对称、随机小粒度访问</strong>是三件不同的事，不能由其中一件推导另外两件。</p><p>SLC/MLC/TLC/QLC分别常指每cell存1/2/3/4 bit，对应2/4/8/16个可区分状态。状态更多意味着电压窗口更密，噪声、漂移和老化的容忍空间更小；是否采用更多bit/cell是容量、延迟、可靠性与成本共同决策，不能只看密度。</p>"
+        },
+        {
+          "id": "nand-organization",
+          "title": "02｜先认识string，再认识page到die",
+          "html": "<p><strong>string</strong>是一串串联cell。读某个cell时，目标字线施加判读电压，其他未选字线用pass电压使路径可导通，通过位线感测整串电流。它并不是一个字节一个引脚的随机访问结构。多个string并排组织，字线横跨这些string。</p><table><thead><tr><th>层级</th><th>用途</th><th>不要照搬DRAM概念</th></tr></thead><tbody><tr><td>Page</td><td>基本读/编程组织，附带纠错及管理开销</td><td>不等于CPU 4KiB虚拟页；多bit/cell时同一wordline涉及多个逻辑页</td></tr><tr><td>Block</td><td>擦除单位，包含很多page</td><td>不等于cache block</td></tr><tr><td>Plane</td><td>含阵列与局部数据路径，支持一定多plane并行</td><td>并行操作仍有地址和资源限制</td></tr><tr><td>Die/LUN</td><td>更高层执行/互连单元</td><td>LUN定义需看器件协议，不能永远与die画等号</td></tr><tr><td>Package/stack</td><td>组合多个die并接到控制器</td><td>堆更多die不自动使外部接口带宽等比例增加</td></tr></tbody></table><p><strong>数据路径：</strong>NAND array → sense/page buffer → cache/data register → 外部I/O。先感测一页与从buffer传走数据是不同阶段；缓存命令和多die交错可重叠阶段，正如流水线提高吞吐却不消除首个请求延迟。</p>"
+        },
+        {
+          "id": "nand-operations",
+          "title": "03｜读、编程、擦除：三种不同的账",
+          "html": "<p>读通常先把目标页从阵列感测进page buffer，再通过I/O传出需要的数据。即便接口允许只传其中一段，<strong>阵列内部也可能已经付过整页感测成本</strong>。要区分阵列读放大、总线传输放大以及应用请求粒度。</p><p>编程通过受控脉冲及校验，把cell推向目标阈值区间。通用NAND不能像DRAM一样任意反复原地覆盖；常见做法是写入新位置，旧页标无效。擦除则以block为单位重置状态。具体partial-page program次数、页写入顺序、多plane操作限制都要读器件datasheet，不能用一条经验代替协议。<a href=\"https://americas.kioxia.com/content/dam/kioxia/en-us/business/memory/mlc-nand/asset/KIOXIA_Efficient_Garbage_Collection_Operations_Tech_Brief.pdf\" target=\"_blank\" rel=\"noopener\">KIOXIA更新与回收流程</a></p><p><strong>教学假设：</strong>页大小16KiB、阵列读20µs、输出接口2GB/s。单页输出约8.19µs；串行完成需约28.2µs，对应约0.58GB/s。若双buffer允许感测与传输重叠，长期上限受较慢的20µs阶段限制，约0.82GB/s，而不是2GB/s。再增加可并行plane才有机会继续提高。所有数值只用于练习，不能当HBF或现代NAND规格。</p>"
+        },
+        {
+          "id": "nand-ftl",
+          "title": "04｜FTL不是多余固件：它在修补物理介质与软件语义的差距",
+          "html": "<p>软件要“把逻辑地址A更新成新值”，介质却不擅长原地更新。<strong>Flash Translation Layer</strong>维护逻辑到物理映射：把新数据写到可用page，原子地更新映射，旧page成为垃圾；再由GC回收失效空间。坏块管理和wear leveling解决不可用位置与磨损不均。ECC校正一定范围的错误，read retry可能改变判读条件以恢复数据。<a href=\"https://americas.kioxia.com/content/dam/kioxia/en-us/business/memory/mlc-nand/asset/KIOXIA_Efficient_Garbage_Collection_Operations_Tech_Brief.pdf\" target=\"_blank\" rel=\"noopener\">KIOXIA L2P与GC</a>；<a href=\"https://www.micron.com/sales-support/sales/faqs\" target=\"_blank\" rel=\"noopener\">Micron ECC/错误处理</a></p><p>这些功能位于哪一层取决于产品：SSD控制器、managed NAND固件、host或定制HBF base die都可能承担一部分。<strong>HBF不是必须原样搬入完整SSD FTL，也不是可以取消所有可靠性管理。</strong>只读权重工作集可以简化随机更新、日志和GC路径，但仍要知道坏块在哪里、数据是否正确、何时迁移。</p><p>地址映射也有容量成本。教学假设1TiB介质用4KiB粒度映射、每表项4B，则表有2^28项，占1GiB；若按2MiB连续burst映射，表项约2^19个，只占2MiB。后者需要更强的连续布局契约，而且碎片、坏块和更新会使简单模型复杂化。</p>"
+        },
+        {
+          "id": "nand-wa",
+          "title": "05｜写放大和读放大：两个容易漏算的系数",
+          "html": "<pre>写放大 WAF = NAND实际写入量 / 主机逻辑写入量\n读放大 RAF = 实际读取或搬运量 / 应用有用量\n有效带宽 ≈ 物理服务带宽 × 利用率 / RAF</pre><p><strong>教学GC例子：</strong>一个block有256页，回收时128页仍有效。先搬走这128页，再擦除，净获得128页可用空间。若随后承接128页主机新写，实际写256页，WAF=2（只计此循环，忽略元数据）。如果每个victim block有90%有效数据，回收会更不经济；选择更合适的victim、冷热隔离和预留空闲空间可以改善。</p><p>读放大也不能盲目追求最小：若读取一个更大连续块能显著减少命令数量、改善并行度和接口效率，多读一点可能反而更快。但若随机64B请求每次迫使取4KiB且无复用，RAF=64；1TB/s物理带宽最多提供15.625GB/s有用字节，还没扣时延与排队。</p><p>面试里解释性能异常时，应同时问<strong>平均值与尾延迟</strong>。GC、read retry、迁移等后台工作可能偶发阻塞前台，即使平均GB/s很好，P99也可能难以满足服务要求。</p>"
+        },
+        {
+          "id": "nand-3d",
+          "title": "06｜“几百层NAND”与“16-high HBF”为什么不能相乘成通道数",
+          "html": "<p>3D NAND的很多层通常描述<strong>一个die内部</strong>沿垂直方向构造的存储结构；16-high描述<strong>封装中</strong>堆了16个存储die。前者主要提高阵列密度，后者增加封装容量，两者均不等于独立plane数，也不等于对外channel数。</p><p>高密度NAND要兼顾高深宽比结构的制造、字线/位线电阻电容、阈值分布和多层均匀性。CBA等阵列与CMOS分开制造再键合的方法，给外围电路的工艺及布局更多自由；这仍不是“每层都可独立以TB/s读出”的证据。</p><p>最后一个关键区别是<strong>refresh的含义</strong>：DRAM周期性恢复cell电荷；NAND虽无需这种持续刷新，仍有retention drift、read disturb及必要的数据迁移/重写。静态权重读得极频繁时，host没有写操作也可能产生介质维护写。<a href=\"https://www.micron.com/sales-support/sales/faqs\" target=\"_blank\" rel=\"noopener\">Micron read disturb问答</a> 这正是后面FLINT要专门处理的系统问题。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "HBF如果是只读权重，为什么还要管理写耐久和刷新？",
+          "answer": "只读通常是应用语义。NAND的高频读会引起read disturb，保持状态也随时间和温度变化；纠错后迁移重写、模型重载都产生介质写。可以简化通用随机写FTL，但不能省略ECC、坏块及维护策略。",
+          "followups": [
+            "DRAM refresh和NAND refresh如何区分？",
+            "怎样把维护写从token关键路径移开？"
+          ]
+        },
+        {
+          "q": "NAND读4KiB请求，就一定只在阵列读取4KiB吗？",
+          "answer": "不一定。应用请求、接口传输和阵列page read可以是不同粒度。可能整页感测后只传部分数据，也可能多个请求复用page buffer。需分别测量阵列读放大与链路读放大。",
+          "followups": [
+            "读放大高但带宽利用率也提高，如何判断总体是否收益？"
+          ]
+        },
+        {
+          "q": "为什么page不能一直原地覆盖？",
+          "answer": "编程只能在器件允许的方向和顺序调整阈值状态，恢复通常要block erase；任意覆盖会违反介质条件并影响可靠性。所以FTL常用异地写加映射更新，后续GC回收旧页。",
+          "followups": [
+            "失电发生在数据写完但映射未提交时怎么办？"
+          ]
+        },
+        {
+          "q": "增加plane数就能等比例提高NAND带宽吗？",
+          "answer": "需要足够独立请求，阵列感测、page buffer、命令地址约束、外部I/O和供电都要配套。只增加plane却共享拥堵输出通道，收益会很快封顶。",
+          "followups": [
+            "请画出感测与输出双buffer流水线。"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "NAND最常见的擦除粒度是？",
+          "options": [
+            "一个CPU cache line",
+            "一个page",
+            "一个block"
+          ],
+          "correct": 2,
+          "explanation": "NAND通常page读/编程、block擦除，具体限制看器件。"
+        },
+        {
+          "q": "主机写100GB，GC等使NAND共写250GB，WAF是多少？",
+          "options": [
+            "0.4",
+            "1.5",
+            "2.5"
+          ],
+          "correct": 2,
+          "explanation": "250/100=2.5。WAF是总物理写入/逻辑写入，不是只算额外部分。"
+        },
+        {
+          "q": "一颗232层NAND die堆叠16片，能推出有3712个独立channel吗？",
+          "options": [
+            "能",
+            "不能"
+          ],
+          "correct": 1,
+          "explanation": "die内cell堆叠层数、die封装堆叠、plane及channel是不同维度。"
+        }
+      ],
+      "sourceIds": [
+        "f05",
+        "f06",
+        "f07",
+        "f10"
+      ]
+    },
+    {
+      "id": "hbf",
+      "title": "HBF：高带宽Flash，到2026年究竟已知什么",
+      "group": "frontier",
+      "level": "advanced",
+      "minutes": 55,
+      "intro": "截至2026-10-30，HBF已经有厂商公布的技术规范和系统研究，但公开规格、路线图、仿真架构与可购买产品必须分层讨论。本章的核心是：利用海量并行NAND读取得到高吞吐，同时承认它仍有较高访问延迟、粗粒度和维护成本。",
+      "prerequisites": [
+        "nand",
+        "hbm"
+      ],
+      "outcomes": [
+        "准确区分HBF的已公布规范、历史产品目标和未验证细节",
+        "用带宽时延积计算需要的并行度",
+        "解释HBF与HBM互补的条件",
+        "在面试中识别营销数字、模拟参数与产品指标"
+      ],
+      "sections": [
+        {
+          "id": "hbf-evidence",
+          "title": "01｜一张表把已知、目标、未知分开",
+          "html": "<table><thead><tr><th>证据层级</th><th>可说的结论</th><th>不能顺带推断</th></tr></thead><tbody><tr><td>2026-08官方标准公告</td><td>Sandisk和SK hynix宣布经OCP发布首版HBF技术规范</td><td>所有合作方已量产装机</td></tr><tr><td>SK hynix公布的规格范围</td><td>8-high/16-high、容量最高512GB、约0.4–3.0TB/s分三档、UCIe连接</td><td>最高容量与最高速度必属同一现售SKU，或随机访问均达该速度</td></tr><tr><td>2025 Sandisk fact sheet</td><td>描述256Gb/die、16-die 512GB和1.6TB/s读带宽目标</td><td>这是2026首版规范唯一配置或独立实测</td></tr><tr><td>学术论文配置</td><td>可以研究给定页、时延、通道、维护策略下的收益</td><td>论文的2µs、SLC或FTL一定是厂商最终设计</td></tr></tbody></table><p>以上规格分别来自<a href=\"https://www.sandisk.com/company/newsroom/press-releases/2026/2026-08-03-Sandisk-and-sk-hynix-advance-global-standardization-of-hbf\" target=\"_blank\" rel=\"noopener\">Sandisk 2026公告</a>、<a href=\"https://news.skhynix.com/en/hbf-at-fms-2026/\" target=\"_blank\" rel=\"noopener\">SK hynix FMS 2026</a>、<a href=\"https://documents.sandisk.com/content/dam/asset-library/en_us/assets/public/sandisk/collateral/company/Sandisk-HBF-Fact-Sheet.pdf\" target=\"_blank\" rel=\"noopener\">Sandisk 2025 fact sheet</a>。标准公告回答“开始如何协作”，产品datasheet才回答“某个具体器件保证什么”。</p>"
+        },
+        {
+          "id": "hbf-position",
+          "title": "02｜HBF究竟在改什么：让Flash更靠近计算，更并行",
+          "html": "<p>普通SSD路径包含主机I/O软件栈、存储协议、控制器、NAND接口和阵列。HBF的目标是让高容量Flash进入更接近加速器的层级，采用高带宽互连和大量阵列并行，减少传统存储访问路径的限制。<strong>“靠近”主要改善搬运路径，并不把Flash cell改成DRAM cell。</strong></p><p>概念上可以拆成：NAND核心阵列提供容量，多个die/plane及局部buffer并行准备数据，base die或对应控制逻辑负责映射、排队、返回及维护，近计算接口把数据送给GPU/加速器。厂商公布了UCIe方向；但具体地址空间语义、最小读粒度、缓存一致性、错误上报和重试机制，仍需具体规范与实现证据。<a href=\"https://news.skhynix.com/en/hbf-at-fms-2026/\" target=\"_blank\" rel=\"noopener\">已公布接口范围</a></p><p><strong>不要说“HBM接口完全兼容，插上就用”。</strong>物理互连能连接异构chiplet，并不自动赋予Flash低延迟、细粒度随机写或透明一致性。把HBF做权重对象层、显式DMA层或GPU可寻址层，会对软件、队列和容错提出不同要求。</p>"
+        },
+        {
+          "id": "hbf-concurrency",
+          "title": "03｜高带宽为什么能与高延迟同时成立",
+          "html": "<p>超市很多收银台可以每秒完成很多订单，但某个订单仍需要完整结算时间。HBF利用并行资源提高长期完成率，无法保证一个存在数据依赖的load立即返回。架构师应首先写下<strong>Little定律/带宽时延积</strong>：</p><pre>所需在途字节 Q ≈ 目标带宽 B × 单次服务延迟 L\n所需独立事务数 N ≈ B × L / 每事务有用数据 g</pre><p><strong>教学假设：</strong>B=1TB/s，L=2µs，则在途数据至少约2MB。若每个有效事务4KiB，需要约489个同时有用的事务；如果只有64B，则约31,250个。真实装置还受bank/plane冲突、队列深度和读放大影响，公式是必要的量级检查，不是充分条件。2µs在FLINT中属于模拟配置，不能据此宣称某商业HBF延迟。<a href=\"https://arxiv.org/html/2608.25062v1\" target=\"_blank\" rel=\"noopener\">FLINT Table 2</a></p><p>若只有一个串行依赖的64B请求，无论标称1TB/s多漂亮，在上述2µs假设下它最多提供32MB/s有用数据。并行度不足时，多通道闲着等；对规则权重流，预取和批量请求有机会填满流水线；对不可预测指针访问则难得多。</p>"
+        },
+        {
+          "id": "hbf-granularity",
+          "title": "04｜页粒度、buffer与预取是架构的主角",
+          "html": "<p>HBF希望按较大块准备数据，GPU往往按cache line或tile消费。中间要回答四件事：<strong>哪些小请求能合并？把完整页存在哪里？何时逐出？如果只用少量字节，谁承担放大？</strong></p><p>教学假设4KiB页中只有256B会用到，RAF=16；物理带宽1TB/s、服务利用率80%时，有用带宽最多50GB/s。若把相邻权重重排并使一页中75%字节都有用，RAF降至1/0.75，同样硬件可达600GB/s有用带宽。布局收益不能只算峰值，需要扣除重排成本、额外索引和地址转换。</p><p>预取提前量应覆盖“排队＋介质读＋传输＋数据就位”的关键路径。过早预取占用HBM/片上buffer、引起污染；过晚预取暴露停顿。MoE专家由token路由决定，下一步要读谁有时只有运行时才知道，因此“提前一层把全部专家拉来”可能浪费容量和带宽。</p><p>同样的原理能在普通Flash研究中看到：<em>LLM in a flash</em>用缓存复用与连续布局减少搬运成本；它是可迁移的方法论，不是HBF硬件实证。<a href=\"https://aclanthology.org/2024.acl-long.678.pdf\" target=\"_blank\" rel=\"noopener\">ACL论文第3节</a></p>"
+        },
+        {
+          "id": "hbf-refresh",
+          "title": "05｜非易失不等于零维护，读路径也要有可靠性预算",
+          "html": "<p>官方资料说NAND无需DRAM式持续刷新，这是介质特征；但保持误差和read disturb仍可能要求纠错、重写和迁移。于是“只读权重”仍可能在后台产生program/erase，影响能耗、寿命和尾延迟。</p><p>一个合理设计需要计数器跟踪读压力，ECC发现错误趋势，冗余空间接收迁移数据，原子映射更新保证前台读始终取到有效副本。迁移还可能争用阵列、内部互连和base die资源。你不能只把它放进平均功耗，再假设性能完全不受影响。</p><p>FLINT提出额外维护plane及轮换机制，把维护与前台读拆开，并依据权重只读特性简化映射。这个例子提示<strong>先围绕工作负载削减控制面复杂度，再为剩余可靠性责任安排资源</strong>。它是预印本的架构提案，不代表最终HBF标准。<a href=\"https://arxiv.org/html/2608.25062v1\" target=\"_blank\" rel=\"noopener\">FLINT第4节</a> 若模型更新很频繁、权重在线训练或KV重写量很大，简化只读路径的前提就不成立。</p>"
+        },
+        {
+          "id": "hbf-claims",
+          "title": "06｜怎样回答“性能距HBM只有2.2%，那还要HBM干嘛”",
+          "html": "<p>第一步翻脚注。Sandisk 2025 fact sheet的2.2%比较限定于<strong>Llama 3.1 405B、8-bit预训练权重读取、逐kernel的xPU性能模型</strong>，HBM容量在比较中被设成无限；文档同时承认HBF有更高延迟和更大page。<a href=\"https://documents.sandisk.com/content/dam/asset-library/en_us/assets/public/sandisk/collateral/company/Sandisk-HBF-Fact-Sheet.pdf\" target=\"_blank\" rel=\"noopener\">原始fact sheet脚注</a></p><p>这能支持“特定可并行权重工作集在模型里能隐藏HBF代价”的论点，不能支持“小随机load、频繁写KV、训练和任何batch都等价HBM”。当算子有足够计算遮住传输，两个存储层可能表现接近；当依赖链直接等数据，延迟差会暴露。</p><p><strong>另一个证据陷阱：</strong>本教程所读HBFSim v1在真实GPU上执行推理并注入模型时序，但该版本6.1明确其flash/thermal参考设备是普通NVMe SSD，并非HBF；GPU执行是真的，HBF行为仍是模型。某项校准误差小，不表示对未来HBF硅有同样误差。<a href=\"https://arxiv.org/html/2609.09800v1\" target=\"_blank\" rel=\"noopener\">HBFSim方法与实验边界</a></p>"
+        },
+        {
+          "id": "hbf-status",
+          "title": "07｜面试该怎么讲路线图与尚未公开的信息",
+          "html": "<p>2025 Sandisk公告给出“2026下半年HBF memory送样、2027年初HBF推理设备送样”的目标。这里应使用<strong>计划/目标</strong>，不能因为日期临近就自动改写成已经实现。当前本包核验的是2026首版规范公告及公开论文，没有将目标当作量产证据。<a href=\"https://www.sandisk.com/company/newsroom/blogs/2025/memory-centric-ai\" target=\"_blank\" rel=\"noopener\">Sandisk路线图</a></p><p>对于具体产品的单请求延迟分布、最小传输粒度、读写干扰、耐久、WAF、热降频曲线、ECC重试、上电恢复及操作系统接口，需要进一步查实现级资料。回答“不知道”时同时提出验证方法：要求随机/顺序、不同并发度和读写混合的latency-bandwidth曲线，以及稳态热和老化后的P99。</p><blockquote>可直接复述：HBF更适合作为近计算的高容量读密集层。我会用权重与KV的读写/复用特征决定放置，保留HBM承接低延迟和写密集热点，再通过并行度、读放大、热与维护模型检验它是否真正降低每token成本。</blockquote>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "HBF能替代HBM吗？",
+          "answer": "不能笼统替代。二者容量、延迟、访问粒度、写行为和维护机制不同。大块、可预测、读密集权重可放HBF；低延迟热点、活跃KV及临时激活更倾向HBM。是否共享封装位置也重要，因为加入HBF可能挤掉HBM容量和带宽。",
+          "followups": [
+            "如果模型本来完全装得下HBM，HBF的收益从哪里来？",
+            "你会优先报告tokens/s还是P99 TPOT？"
+          ]
+        },
+        {
+          "q": "1TB/s、2µs、4KiB事务，大约需要多少并行事务？",
+          "answer": "B×L=2MB在途数据，除4096约489个。此处2µs是教学/模型假设；该数只验证并行度量级，冲突和读放大可能要求更多资源。",
+          "followups": [
+            "如果有效事务只有64B呢？",
+            "队列数足够但全落同一plane怎么办？"
+          ]
+        },
+        {
+          "q": "为什么HBF不能直接继承HBM的软件语义？",
+          "answer": "互连兼容只解决传输路径的一部分。Flash有页读、慢编程、块擦除、维护与错误重试；是否暴露为统一地址空间、由谁预取、如何一致性和故障恢复，需要明确系统契约。",
+          "followups": [
+            "显式DMA层和透明cache层各有什么取舍？"
+          ]
+        },
+        {
+          "q": "如何检查HBF性能宣传是否能用于自己的方案？",
+          "answer": "核对年份和证据类型，确认单位是每stack还是系统、读还是写、峰值还是有效；再看模型、精度、batch、KV、容量约束及是否计入维护和互连。用目标trace重算，不能只套一个比HBM慢百分之几的结果。",
+          "followups": [
+            "请说明2.2%比较的限定。",
+            "真实GPU运行为何仍不等于HBF硅实测？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "2026官方公布0.4–3.0TB/s三档HBF规格，能推出随机64B串行读也达3TB/s吗？",
+          "options": [
+            "能，高带宽就是低延迟",
+            "不能，还受并发度、粒度、时延和实现限制"
+          ],
+          "correct": 1,
+          "explanation": "总吞吐与单请求服务时延不是同一指标；规格范围也不是单SKU所有场景的保证。"
+        },
+        {
+          "q": "2TB/s目标、5µs服务延迟，需要多少在途数据？",
+          "options": [
+            "10KB",
+            "10MB",
+            "10GB"
+          ],
+          "correct": 1,
+          "explanation": "2×10^12B/s×5×10^-6s=10^7B，即10MB。"
+        },
+        {
+          "q": "关于HBFSim，下列哪句准确？",
+          "options": [
+            "已经测量商业HBF完整芯片",
+            "真实GPU执行结合HBF时序模型，普通SSD用于部分校准",
+            "只要校准点准确就保证全系统预测准确"
+          ],
+          "correct": 1,
+          "explanation": "真实GPU、模拟HBF与普通SSD校准应分别说明；覆盖范围和外推条件限制结论。"
+        }
+      ],
+      "sourceIds": [
+        "f08",
+        "f09",
+        "f10",
+        "f11",
+        "f12",
+        "f13",
+        "f22"
+      ]
+    },
+    {
+      "id": "hbf-system",
+      "title": "GPU—HBM—HBF—SSD：权重、KV与MoE如何分层",
+      "group": "frontier",
+      "level": "advanced",
+      "minutes": 60,
+      "intro": "这章把前面的器件知识变成架构面试答案。不是先问“能不能把显存换成HBF”，而是给每类数据写清大小、生命周期、读写比、复用次数和关键路径，再设计放置、预取及准入策略。所有手算例子的数值均为教学假设。",
+      "prerequisites": [
+        "hbf",
+        "gpu-memory"
+      ],
+      "outcomes": [
+        "手算权重、GQA KV容量与带宽下界",
+        "解释prefill/decode/batch怎样改变存储瓶颈",
+        "为MoE及KV提出能验证的分层方案",
+        "识别容量收益、尾延迟、耐久及封装机会成本"
+      ],
+      "sections": [
+        {
+          "id": "hbf-placement",
+          "title": "01｜先给数据分类，再谈哪层存什么",
+          "html": "<table><thead><tr><th>数据</th><th>主要特征</th><th>候选位置/策略</th></tr></thead><tbody><tr><td>稠密模型权重</td><td>部署时写，推理中频繁读；通常可预测</td><td>装得下且延迟敏感时HBM；容量受限可考虑HBF顺序流与预取</td></tr><tr><td>MoE专家权重</td><td>总量大，单token仅用部分，热度不均</td><td>热专家HBM、冷专家HBF；调度与路由共同决定命中</td></tr><tr><td>活跃KV</td><td>不断追加，注意力反复读；增长可预测</td><td>优先HBM，并为即将生成的token留空间</td></tr><tr><td>可复用历史prefix KV</td><td>写一次后可能多次命中，价值取决于复用</td><td>选择性进入HBF/host层，按收益而非单纯LRU决定</td></tr><tr><td>临时activation/workspace</td><td>短命、频繁写</td><td>SRAM/HBM更合适；避免无意义地写入Flash</td></tr><tr><td>长期模型仓库/检查点</td><td>容量大、访问较稀疏</td><td>SSD作后备，按部署需求载入近端层</td></tr></tbody></table><p>这是<strong>设计起点而非固定规定</strong>。HBF研究中既有偏权重容量层的FLINT，也有偏KV服务的工作，它们回答的问题不同。<a href=\"https://arxiv.org/html/2608.25062v1\" target=\"_blank\" rel=\"noopener\">FLINT</a>；<a href=\"https://arxiv.org/html/2609.39131v1\" target=\"_blank\" rel=\"noopener\">HBF serving研究</a></p>"
+        },
+        {
+          "id": "hbf-weights",
+          "title": "02｜权重与decode：先用字节把“能跑多快”算明白",
+          "html": "<p><strong>教学假设：</strong>70B参数，INT4权重，则原始权重约70×10^9×0.5=35GB；实际还要加量化scale/zero point、对齐、部分高精度层。若batch=1，每个decode step都完整读35GB，没有跨step缓存，且有效权重带宽1TB/s，则仅权重流下界35ms/token，对应不超过约28.6token/s。计算、KV、同步和kernel开销只会让实际更慢。</p><p>若batch=8能在一次权重加载中处理8个序列，则同样35ms的理想步时间可产8个token，总吞吐上界约228.6token/s；<strong>单请求token间隔仍约35ms</strong>，不能把228.6倒数当成每个用户的TPOT。batch增大还会增加KV读写和排队，因此不能无限摊薄。</p><pre>共享HBM接口：T_HBM ≥ (D权重_HBM + D_KV_HBM + D其他_HBM) / B_HBM\n对每个共享资源先合并字节/运算需求，再求各自服务时间\n理想重叠下界：Tstep ≥ max(各资源服务时间, 必须串行的依赖链时间)</pre><p><strong>重叠必须按物理资源分析：</strong>若权重和KV共用HBM接口，不能分别用满该接口带宽，再把两段时间取max；HBF填入HBM的流量也会占用目的端。读写方向切换、有效带宽和多个通道的分布应另行计入。只有资源确实独立且依赖允许，计算、HBF传输与HBM服务才可能交叠。固定一组服务操作、没有额外开销时，充分重叠的max下界与完全串行的服务时间之和构成理想比较区间；实际队列、同步、调度和新增搬运可使耗时超过这个朴素求和，不能把它当实际运行上界。</p><p>prefill更接近大矩阵乘，权重复用与算术强度通常较高；decode小batch常更像GEMV，权重搬运更显眼。但长上下文、大batch、稀疏注意力及MoE会改变主瓶颈，所以先测而不背“prefill永远compute-bound”。</p>"
+        },
+        {
+          "id": "hbf-kv",
+          "title": "03｜KV容量别用模型参数量猜，要从张量维度算",
+          "html": "<pre>常规GQA/MHA KV字节数 =\n2 × 层数 L × batch B × 上下文长度 S\n  × KV头数 Hkv × 每头维度 D × 每元素字节 e\n前面的2分别代表K与V</pre><p><strong>教学假设：</strong>L=80、Hkv=8、D=128、FP16即e=2，则每序列每token KV=327,680B=320KiB。S=32,768时约10GiB/序列；B=16时约160GiB。这个公式是常规KV布局；MLA压缩、量化、sliding window、稀疏保留、tensor parallel分片及元数据都会改变实际占用，不能直接照套所有模型。</p><p>decode不仅追加新KV，还会读取已有历史。新增写很小不代表总流量小；反过来，某层缓存写入了大量新KV，却几乎没有再命中，则Flash层的写入也不值。设计必须分别统计<strong>新增字节、读回字节、读取放大、重复迁移次数和被丢弃的字节</strong>。</p><p>若用全满HBM作为准入条件，新请求进入后继续生成会让KV溢出，被迫迁出再读回。可按最大新增token或置信区间留headroom，牺牲一点即时batch，换取少迁移、较稳定TPOT和较少Flash写。<a href=\"https://arxiv.org/html/2609.39131v1\" target=\"_blank\" rel=\"noopener\">buffered cache-aware scheduling</a></p>"
+        },
+        {
+          "id": "hbf-moe",
+          "title": "04｜MoE不是只看“激活参数量”，还要看专家落在哪里",
+          "html": "<p>总参数决定模型要占多少空间，激活参数决定某token至少需要读/算多少；batch中的不同token可能选不同专家，所以一个step触及的专家集合可能随batch扩大。热点偏斜有利于缓存，但专家不均衡又可能使少数执行单元或存储通道拥堵。</p><p><strong>教学假设：</strong>每步需读取10GB专家权重，70%字节命中HBM，剩余3GB去HBF；HBF物理带宽1TB/s、利用率80%、读放大1.5，有效带宽约533GB/s，HBF分支至少5.63ms。若只有一个独立请求链无法维持80%利用率，这个下界不再可达。若热专家集合漂移，预装缓存也要付更新流量。</p><p>可提出三种方案并比较：按历史热度常驻，按即将路由结果动态预取，或在受精度/模型约束允许时采用路由预测。评价命中率必须用<strong>字节和关键路径</strong>加权：命中很多很小专家、漏掉少数巨大专家，计数命中率会骗人。研究中的“离线已知专家查找/理想负载均衡”只是上界或受限实验条件。<a href=\"https://arxiv.org/html/2609.39131v1\" target=\"_blank\" rel=\"noopener\">论文配置及局限</a></p>"
+        },
+        {
+          "id": "hbf-lifetime",
+          "title": "05｜把写耐久变成可算的预算",
+          "html": "<pre>简化理想寿命（天）≈\n物理可轮换容量 × 可承受P/E次数\n÷（每日NAND总物理写入量）</pre><p>若WAF按前文定义为总物理写入/主机写入，分母可写为每日主机写入量×WAF，此时不能再加一次已计入WAF的维护写。只有明确将WAF限定为主机诱发写放大、排除独立维护时，才另加维护写入量。主机写入接近零的只读权重层应直接统计维护造成的物理写入，避免使用没有稳定分母的WAF。</p><p><strong>纯教学假设，绝非HBF寿命规格：</strong>沿用320KiB新增KV/token，系统总生成速率1000token/s，若全部KV都落Flash，每天逻辑写约28.31TB。假设可轮换容量1TB、10,000次P/E、WAF=2且忽略维护，理想均匀磨损寿命约176.6天。若仅10%有复用价值的KV写入，其他条件不变则约1766天。这个数量级练习说明<strong>准入策略可能比单纯提高读带宽更重要</strong>。</p><p>真实寿命还受器件模式、温度、retention要求、误码裕量、坏块退役、热点与冗余容量影响。不要拿某论文假设的100k P/E当厂商保证；也不能用“读密集”标签忽略迁移写。</p><p>对于prefix缓存，一个简单价值模型是：预期未来命中次数×每次避免的重算/读回成本，减去写入、驻留机会成本及维护成本。阈值可随流量调整。频繁写入却从不读回的冷尾部，应该被拒绝入层，而不只是被更快写入。</p>"
+        },
+        {
+          "id": "hbf-opportunity",
+          "title": "06｜HBF不一定是白送容量：封装位置也有机会成本",
+          "html": "<p>比较至少要区分两种组织：<strong>增加额外HBF资源</strong>，与<strong>在固定封装位置中用HBF替代部分HBM</strong>。前者多了容量也多了面积/功耗；后者的HBM容量和带宽可能减少，热数据的性能损失可能大于远端读加速。</p><p>2026的KV-centric研究在生产trace衍生的系统模拟中发现，沿用SSD式KV卸载运行时直接改用特定HBF组织，可能使整体服务变差。论文自己明确：实验同时改变了近端容量/带宽，结论针对完整配置，<strong>不证明单独HBF介质比SSD慢</strong>。<a href=\"https://arxiv.org/html/2608.11668v1\" target=\"_blank\" rel=\"noopener\">Full-Stack Characterization第9.3节</a></p><p>相反，另一个研究通过放置及调度改善高吞吐服务。但同一结果表中，某配置总完成时间下降时，平均TPOT仍可能上升；更多并发能够提升总吞吐却拖慢单用户。<a href=\"https://arxiv.org/html/2609.39131v1\" target=\"_blank\" rel=\"noopener\">Characterizing HBF第5节</a> 面试不能只说“加速百分之几”，要先说目标是吞吐、TTFT、P99 TPOT，还是满足SLO后的每token成本。</p>"
+        },
+        {
+          "id": "hbf-experiment",
+          "title": "07｜把方案写成能跑实验的五步",
+          "html": "<ol><li><strong>固定问题：</strong>模型/精度、上下文与输出长度分布、到达率、延迟SLO；记录热身和稳态时长。</li><li><strong>基线公平：</strong>HBM-only、HBM+SSD、HBM+HBF；说明是否同GPU数、同容量、同成本或同封装预算，不能在不同图中悄悄切换。</li><li><strong>采集分项：</strong>每层读写字节、命中率、RAF/WAF、page/plane并行度、排队、KV重算、跨卡通信和维护停顿。</li><li><strong>扫参数：</strong>HBF延迟、有效带宽、页大小、HBM容量、专家热度、write budget、温度及P/E假设；用敏感性区间替代单个漂亮点。</li><li><strong>报告业务结果：</strong>goodput（满足SLO的有效吞吐）、TTFT/TPOT分位数、每token能耗和成本，并保留失败反例。</li></ol><p>最有力的反例包括：模型完全适配HBM且几乎不offload；小batch串行依赖；随机小粒度；KV冷尾部大量写且少复用；HBF挤占过多HBM；长时间热降频。能主动给出失败区间，比只会推销新器件更像架构工程师。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "设计一个HBM+HBF推理系统，你第一句话会说什么？",
+          "answer": "先确定服务目标和数据特征：是容量装不下、带宽不够、还是延迟不达标；分别量化权重、活跃KV和可复用prefix。然后判断HBF是在新增位置还是替代HBM，用明确工作负载和SLO比较。",
+          "followups": [
+            "权重和KV分别怎么放？",
+            "哪些数据绝不应该无条件写HBF？"
+          ]
+        },
+        {
+          "q": "为什么增加batch能提高总token/s，却可能降低体验？",
+          "answer": "批处理可复用权重并提高计算利用率，但单step工作和KV流量也增加，还可能增加排队。总token/s是所有序列合计，用户体验看其TTFT及连续token间隔。应按SLO goodput选batch。",
+          "followups": [
+            "8个序列每35ms各出1token，总吞吐和单请求TPOT各是多少？"
+          ]
+        },
+        {
+          "q": "MoE只激活少量专家，为什么HBF仍可能卡住？",
+          "answer": "选中专家可能不在HBM、路由到达较晚、访问页不连续，且batch内专家并集可能很大；page读取放大和plane热点使峰值带宽难以利用。需联合缓存、布局、预取及调度。",
+          "followups": [
+            "用专家数量命中率还是字节命中率？",
+            "预测错误时如何避免阻塞正确专家？"
+          ]
+        },
+        {
+          "q": "有两篇HBF论文一篇说更快，一篇说更慢，如何回答？",
+          "answer": "先对齐系统边界、基线、容量预算、HBM是否被替换、数据放置和SLO。权重只读层与KV写密集层不同；高吞吐目标与低TPOT目标也不同。用共同假设重建模型，找结论翻转点，而不是投票选论文。",
+          "followups": [
+            "给出一个改变单一变量就让结论反转的例子。"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "70B INT4原始权重约35GB，1TB/s有效带宽完整读一遍至少多久？",
+          "options": [
+            "0.035ms",
+            "3.5ms",
+            "35ms"
+          ],
+          "correct": 2,
+          "explanation": "35×10^9/10^12=0.035s。量化元数据等会增加真实流量。"
+        },
+        {
+          "q": "batch=8，每35ms各输出1token，哪一项正确？",
+          "options": [
+            "总吞吐约228.6token/s，单请求TPOT约35ms",
+            "单请求TPOT约4.375ms",
+            "每个请求都达到228.6token/s"
+          ],
+          "correct": 0,
+          "explanation": "总吞吐摊到8条序列；每条序列仍要等下一step。"
+        },
+        {
+          "q": "HBF层频繁接收KV，却很少读回，优先改什么？",
+          "options": [
+            "先提高写入准入门槛和复用预测",
+            "无条件把更多KV写进去",
+            "只比较读峰值"
+          ],
+          "correct": 0,
+          "explanation": "写入未被未来复用偿还时，会消耗带宽、能耗和寿命；先减少无价值搬运。"
+        }
+      ],
+      "sourceIds": [
+        "f12",
+        "f20",
+        "f21",
+        "f22"
+      ]
+    },
+    {
+      "id": "pim",
+      "title": "PIM系统地图：计算放在哪里，究竟省了哪段搬运",
+      "group": "frontier",
+      "level": "advanced",
+      "minutes": 50,
+      "intro": "“存算融合”是大伞，不能把HBM旁的数字ALU、DRAM阵列内逻辑和模拟交叉阵列当成同一技术。本章先建立系统位置、数据路径和软件代价的框架；数字、模拟、混合及材料层面的细节继续进入对应CIM专题。",
+      "prerequisites": [
+        "dram-array",
+        "hbm",
+        "gpu-memory"
+      ],
+      "outcomes": [
+        "按计算位置而不是宣传名称区分PIM类型",
+        "解释Ambit、SIMDRAM、HBM-PIM和UPMEM各自的数据路径",
+        "判断低算术强度是否足以让PIM获益",
+        "检查一致性、布局、跨bank通信和端到端加速"
+      ],
+      "sections": [
+        {
+          "id": "pim-map",
+          "title": "01｜先问计算在哪里，名称留到后面",
+          "html": "<table><thead><tr><th>位置/机制</th><th>算什么</th><th>减少什么搬运</th><th>主要代价</th></tr></thead><tbody><tr><td>Near-memory逻辑层或附近处理器</td><td>数字指令/专用算子</td><td>远距离CPU/GPU与内存传输</td><td>逻辑面积、热、接口与调度</td></tr><tr><td>Bank附近数字ALU</td><td>向量加乘、MAC等</td><td>row buffer数据无需全部出芯片</td><td>每bank算力有限、跨bank归约</td></tr><tr><td>DRAM阵列内bulk logic</td><td>整行位逻辑及组合运算</td><td>大量数据留在子阵列</td><td>特殊行/操作、布局、可靠性</td></tr><tr><td>模拟CIM阵列</td><td>电流/电荷域乘加</td><td>权重读到独立MAC的反复传输</td><td>转换、噪声、精度、非理想和校准</td></tr></tbody></table><p>学界与厂商对PIM/PNM/CIM的命名并不完全统一。面试时用“<strong>位置＋数据流＋运算域</strong>”消歧：例如“bank附近数字SIMD单元”，比只说“数字存算”清楚。HBM是存储接口及堆叠体系，本身不等于HBM-PIM。</p>"
+        },
+        {
+          "id": "pim-bandwidth",
+          "title": "02｜PIM不是凭空产生算力，而是搬运账重新分配",
+          "html": "<p>以<code>y=A×x</code>为例，普通GEMV要把矩阵A不断送到计算单元；若A常驻各bank并在当地乘加，只需广播较小的x并汇总y，就可能减少外部流量。但本地仍需从cell经感应放大器和局部总线送到ALU，还可能在bank间归约。</p><pre>T_PIM ≈ T放置/转置 + T启动 + T本地算子\n        + T跨bank/跨die通信 + T结果回传 + T一致性\n收益条件：避免的搬运时间 > 新增开销</pre><p><strong>教学假设：</strong>总任务100ms，其中80ms是适合下沉的部分，PIM将其缩为10ms，额外布局和同步花8ms。总时间20+10+8=38ms，加速2.63倍，而不是8倍。若每次只处理很小数据，启动成本就可能吃掉全部收益。</p><p>低算术强度只是候选条件。若操作依赖大量除法、分支或全局通信，弱小PIM核可能先遇到计算或互连瓶颈。迁到存储旁边后，原来在GPU上memory-bound的程序，完全可能在PIM上compute-bound。</p>"
+        },
+        {
+          "id": "pim-ambit",
+          "title": "03｜Ambit：借DRAM电荷共享做精确的批量位逻辑",
+          "html": "<p>Ambit利用同一位线上三行同时参与电荷共享，感应结果对应多数函数<code>MAJ(a,b,c)</code>。将第三行预置0得到AND，预置1得到OR；再配合NOT机制组合逻辑。它需要设计支持的专用操作与临时行，不是对任意现售DIMM发三次ACT就保证正确。<a href=\"https://www.microsoft.com/en-us/research/wp-content/uploads/2017/09/MICRO-50_347.pdf\" target=\"_blank\" rel=\"noopener\">Ambit第3–5节</a></p><p><strong>原创推导练习：</strong>当c=0，多数为1必须a=b=1，所以是a AND b；c=1时，只要a或b为1就形成多数，所以是a OR b。每列都能同时进行这个判断，整行得到大量并行bit操作。</p><p>注意两点：一是恢复过程会把参与cell写成结果，必须考虑源操作数保护与复制；二是数据最好位于可共享该局部电路的范围，跨子阵列移动会削弱收益。它利用模拟电荷行为，却产出离散、精确目标的布尔结果；<strong>不能因此称它为一个高精度模拟矩阵乘芯片</strong>。</p>"
+        },
+        {
+          "id": "pim-simdram",
+          "title": "04｜SIMDRAM：把一个数竖着存，换来大量并行数据",
+          "html": "<p>常规布局把一个整数的多个bit放在同一访问字中；bit-serial布局让一个元素的不同bit分布在不同DRAM行，而一条bitline对应一个元素。这样一次整行逻辑能对很多元素的同一位并行计算，复杂运算再沿位次逐步完成。</p><p>SIMDRAM将目标操作转换成MAJ/NOT网络，分配计算行并生成DRAM命令序列，再由控制单元执行。论文属于<strong>ASPLOS 2021</strong>，系统评估用gem5等模型，不能当已量产CPU扩展。<a href=\"https://people.inf.ethz.ch/omutlu/pub/SIMDRAM_asplos2021.pdf\" target=\"_blank\" rel=\"noopener\">SIMDRAM机制及方法</a></p><p>你应提出的取舍是：位宽越大，串行步骤越多；乘除法比简单逻辑更难；输入输出的横竖转置、地址定位和跨子阵列复制要计入端到端时间。若一批bit-sliced数据能复用很多次，转换成本容易摊薄；若每次转置后只做一个小运算，专用ALU可能更合适。<strong>功能可表达，不等于每种功能都高效。</strong></p>"
+        },
+        {
+          "id": "pim-banks",
+          "title": "05｜HBM-PIM与UPMEM：仍是数字算，只是算在bank附近",
+          "html": "<p>Samsung HBM-PIM走bank附近可编程计算路线。其官方PIMSimulator展示了bank row buffer、向量/标量寄存器、指令寄存器及ADD/MUL/MAC等操作，利用内存命令触发计算。它省掉的是把大批权重搬到外部处理器的过程，不是取消阵列激活与局部数据传输。<a href=\"https://news.samsungsemiconductor.com/global/samsung-develops-industrys-first-high-bandwidth-memory-with-ai-processing-power/\" target=\"_blank\" rel=\"noopener\">Samsung官方披露</a>；<a href=\"https://github.com/SAITPublic/PIMSimulator\" target=\"_blank\" rel=\"noopener\">官方PIMSimulator</a></p><p>UPMEM在DRAM芯片内集成与bank关联的DPU。已读真实系统研究中，每个DPU有专用DRAM bank、WRAM scratchpad和IRAM；MRAM在这里是<strong>Main RAM，不是磁性MRAM材料</strong>。研究发现简单运算、较少跨DPU通信的负载更合适，复杂运算和经host中转的DPU通信会限制收益。<a href=\"https://arxiv.org/pdf/2105.03814\" target=\"_blank\" rel=\"noopener\">UPMEM实验研究</a></p><p>两者都提醒你检查本地算力/带宽配比。一个银行里存了很多数据，却只有很小ALU，就可能很快从外部带宽瓶颈变成计算瓶颈。对GEMV有利，不代表高复用GEMM也比GPU tensor core有利；比较前要对齐精度、batch和输入布局。</p>"
+        },
+        {
+          "id": "pim-system",
+          "title": "06｜面试拉开差距的部分：一致性与软件契约",
+          "html": "<p>假设CPU cache里有A的最新脏副本，而PIM直接读取DRAM旧值，结果会错；若PIM修改了DRAM但CPU还命中旧cache，也会错。可选策略包括显式flush/invalidate、不可缓存区域、按阶段所有权转移或专门一致性协议。选择取决于共享频率和工程复杂度，不是“加个fence就能自动解决所有问题”。</p><p>还要处理虚拟地址到物理bank/子阵列的映射、页迁移、进程隔离、抢占、错误恢复与刷新协调。软件库或编译器必须知道哪些运算值得下沉，怎样组织输入，如何判断完成。<strong>接口兼容、源代码不改、二进制不改、性能透明</strong>是四个不同承诺。</p><p>模拟CIM则多一层数值契约：阵列电流/电荷需要与数字世界衔接，ADC/DAC、累加、校准和数据搬运都要计入；有效精度、模型精度损失与能耗不可分开报。后续进入数字CIM、模拟CIM、混合CIM和材料专题逐项拆解。对任何PIM方案，先问“数据从哪来、在哪算、怎么回去、谁保证正确”，再看TOPS/W。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "PIM能否替代GPU？",
+          "answer": "应按算子和数据流划分。低复用、大流量且本地可算的部分可能受益；高复用GEMM、复杂控制和跨bank通信可能仍适合GPU/CPU。PIM增加一种执行位置，端到端需要异构调度和一致性，而非简单整机替代。",
+          "followups": [
+            "小batch GEMV和大batch GEMM为什么可能选择不同位置？"
+          ]
+        },
+        {
+          "q": "Ambit为什么能做AND/OR，它是不是模拟CIM？",
+          "answer": "三行共享位线产生多数函数，第三行0得到AND、1得到OR；其物理操作有模拟电荷共享，但目标运算是精确bit逻辑，不是模拟多bit MAC。需要专门支持、临时行和源数据保护。",
+          "followups": [
+            "结果恢复会改写哪些cell？",
+            "操作数跨subarray时怎么办？"
+          ]
+        },
+        {
+          "q": "SIMDRAM支持任意组合逻辑，是否意味着高精度浮点运算也很快？",
+          "answer": "不能。可表达性与性能不同；bit-serial步骤随位宽和操作复杂度增加，还要算转置、复制和命令控制成本。应选择结构规则、数据量大、低位宽且易复用布局的任务。",
+          "followups": [
+            "用32bit乘法而非AND时，你预期哪个瓶颈先出现？"
+          ]
+        },
+        {
+          "q": "为什么UPMEM旁边带宽高，还会compute-bound？",
+          "answer": "本地计算核的吞吐和指令支持有限。原本主机上受内存限制的任务搬过去后，除乘浮点等可能需要很多指令，指令流水线先饱和；跨DPU通信还可能经过host。",
+          "followups": [
+            "MRAM在UPMEM文档中指什么？",
+            "怎样区分kernel加速和含传输的端到端加速？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "MAJ(a,b,0)等价于什么？",
+          "options": [
+            "a OR b",
+            "a AND b",
+            "a XOR b"
+          ],
+          "correct": 1,
+          "explanation": "三输入多数要至少两个1。第三输入固定0，只有a=b=1时输出1。"
+        },
+        {
+          "q": "PIM执行前，CPU有输入的脏cache副本，应该关注什么？",
+          "options": [
+            "只增加PIM时钟即可",
+            "数据一致性、所有权和可见性",
+            "仅提高ECC强度"
+          ],
+          "correct": 1,
+          "explanation": "PIM读DRAM可能拿到旧值，需明确同步和数据可见性契约。"
+        },
+        {
+          "q": "SIMDRAM中bit-serial的主要取舍是？",
+          "options": [
+            "无限位宽无额外延迟",
+            "用更多逐位步骤换取大量数据元素并行",
+            "完全不需要布局变换"
+          ],
+          "correct": 1,
+          "explanation": "大量bitline能并行，但单元素的多bit操作要逐步构造，位宽和转置成本重要。"
+        }
+      ],
+      "sourceIds": [
+        "f14",
+        "f15",
+        "f16",
+        "f17",
+        "f18",
+        "f19"
+      ]
+    },
+    {
+      "id": "frontier-papers",
+      "title": "论文训练营：从机制复述进阶到架构取舍",
+      "group": "frontier",
+      "level": "advanced",
+      "minutes": 75,
+      "intro": "面试不需要背八篇摘要。每篇只抓六件事：原瓶颈、改变的硬件/软件、节省的数据路径、新增成本、证据类型和失败条件。下面的“反问自己”是原创面试练习；它们与论文实际结论分开，不能伪装成作者做过的实验。",
+      "prerequisites": [
+        "pim",
+        "hbf-system"
+      ],
+      "outcomes": [
+        "用90秒解释一篇论文及其适用边界",
+        "区分电路仿真、架构仿真、真实平台与厂商声明",
+        "对两篇相反结论做假设对齐",
+        "提出有消融、反例和基线约束的复现计划"
+      ],
+      "sections": [
+        {
+          "id": "paper-ambit",
+          "title": "01｜Ambit · MICRO 2017：物理原语能否变成系统收益",
+          "html": "<p><strong>抓住机制：</strong>把共享位线的电荷多数判决变成整行逻辑操作，减少外部数据搬运；论文包括电路可靠性与系统性能建模，不是普通DIMM上默认支持的应用库。<a href=\"https://www.microsoft.com/en-us/research/wp-content/uploads/2017/09/MICRO-50_347.pdf\" target=\"_blank\" rel=\"noopener\">原论文：第3–5及评估章节</a></p><p><strong>90秒表达：</strong>“它把数据路径缩到子阵列，但我会把专用行、输入复制、结果写回和布局约束放进成本模型。目标应是大量批量位运算；不是所有矩阵乘都合适。”</p><p><strong>原创追问：</strong>你有一张很大的用户权限位图，要执行三次AND和一次OR。若中间结果留在计算行，可以少复制几次？若两张位图分散在不同bank，要搬的数据是否吃掉收益？设计消融时，保持输入布局不变，分别比较“仅计算快”“加入复制”“加入跨子阵列移动”三档，避免只展示理想原语延迟。</p><p><strong>读图习惯：</strong>看到32倍一类聚合加速数字，先找比较的运算集合、基线和是否端到端。不要把批量位逻辑收益变成“CPU所有任务快32倍”。</p>"
+        },
+        {
+          "id": "paper-simdram",
+          "title": "02｜SIMDRAM · ASPLOS 2021：通用性与效率要分开",
+          "html": "<p><strong>抓住机制：</strong>从逻辑表示、计算行分配到命令序列执行，构造DRAM内bit-serial运算；其硬件方案用模拟评估，CPU/GPU比较并不使SIMDRAM变成硅实测。<a href=\"https://people.inf.ethz.ch/omutlu/pub/SIMDRAM_asplos2021.pdf\" target=\"_blank\" rel=\"noopener\">原论文：框架与第6–7节</a></p><p><strong>原创练习：</strong>假设一次数据转置花6ms，本地PIM每个任务1ms，GPU每个任务3ms。若数据可直接复用k次，PIM为6+k，GPU为3k；只有k&gt;3时PIM在这个简化模型下更快。若每次输入都变化、要重新转置，则无法沿用该结论。</p><p>用这个例子解释“数据驻留和复用”如何决定机制落地，而非只复述论文运算吞吐。再问位宽从8bit到32bit时，操作步骤、临时行容量和转置成本如何变；乘法、比较和bitcount不该强行套同一个缩放系数。</p><p><strong>面试加分句：</strong>“支持一个指令只证明表达能力；我要分别给出指令复杂度、数据变换和被调用次数，才能判断实际加速。”</p>"
+        },
+        {
+          "id": "paper-samsung",
+          "title": "03｜Samsung HBM-PIM · ISCA 2021：接口兼容不是软件零成本",
+          "html": "<p><strong>证据说明：</strong>会议论文书目与摘要已核实，但全文访问受限。本节按官方公告和官方开源PIMSimulator讲机制，不把模拟器运行当成论文实片复现。<a href=\"https://ieeexplore.ieee.org/document/9499894/\" target=\"_blank\" rel=\"noopener\">IEEE论文入口</a>；<a href=\"https://github.com/SAITPublic/PIMSimulator\" target=\"_blank\" rel=\"noopener\">Samsung官方实现</a></p><p>可从公开实现观察bank附近计算单元、寄存器和内存命令驱动执行。面试真正该分析的是：既然复用内存接口，host如何配置操作、分发输入、等待完成和读回结果？数据在哪些bank？同一条广播命令怎样让不同bank处理不同数据？</p><p><strong>原创设计题：</strong>把矩阵按输出行分片到bank，则输入向量需要广播，各bank可独立产生部分输出；按输入列分片则各bank产生partial sum，随后需要归约。前者可能复制输入，后者可能增加归约。矩阵维度、bank数量和局部存储决定更合适的分法。</p><p>回答时同时指出CPU/GPU缓存可见性、内存区域管理与库调度的成本。所谓“沿用现有接口”首先降低集成门槛，不能等价于所有应用不调整也自动获益。</p>"
+        },
+        {
+          "id": "paper-upmem",
+          "title": "04｜UPMEM实验研究 · 2021：读懂真实硬件的负结果",
+          "html": "<p><strong>抓住证据：</strong>这项工作在真实UPMEM系统上做微基准和应用测量，揭示计算能力与跨DPU通信限制。它适合训练你在硬件已经存在时，如何寻找可用边界。<a href=\"https://arxiv.org/pdf/2105.03814\" target=\"_blank\" rel=\"noopener\">原论文：系统组织与Key Takeaways</a></p><p><strong>原创分析：</strong>给两个任务：A逐元素过滤后返回少量命中；B每一步都需要全局shuffle。A有机会让每个DPU在本地大数据上筛选，只回小结果；B即使局部计算很快，也可能不断经host交换。你要画出每轮通信字节数，而不是只数DPU数量。</p><p>再加入一个新约束：A的选择率从1%升到90%。返回结果大小暴涨，PIM的通信优势可能变弱；如果过滤谓词变成复杂浮点函数，本地计算也可能成为瓶颈。这两次变量变化，展示了<em>同一个算法名不等于同一种工作负载</em>。</p><p><strong>复现规则：</strong>分别报数据分发、kernel和结果收集时间；标明DPU数量、频率、容量、输入大小和CPU线程数。旧硬件上的相对收益不能直接平移到2026 GPU。</p>"
+        },
+        {
+          "id": "paper-llmflash",
+          "title": "05｜LLM in a flash · ACL 2024：最值得迁移的不是“Flash”这个词",
+          "html": "<p><strong>抓住机制：</strong>普通Flash存权重，按需带入DRAM；windowing复用近期神经元，row-column bundling改善连续读取。它研究软硬件协同加载，既不是FlashAttention，也不是HBF量产验证。<a href=\"https://aclanthology.org/2024.acl-long.678.pdf\" target=\"_blank\" rel=\"noopener\">原论文：第2–4节</a></p><p><strong>原创练习：</strong>方案A随机读2GB、有效速度1GB/s；方案B连续读3GB、有效速度3GB/s。B多读50%却只需1秒，A要2秒。下一步不要立刻宣布B最优：如果缓存容量只剩2GB怎么办？如果多读部分很快被重用呢？把时延、流量和驻留容量一起优化。</p><p>讨论论文适用性时，问模型是否存在可预测激活稀疏、预测器开销及漏预测精度损失；对不具备相同稀疏性/激活模式的模型，机制不保证直接复现同样收益。</p><p><strong>迁移到HBF的表达：</strong>“我借鉴它减少有效搬运和匹配访问粒度的思路，但重新标定HBF延迟、并行度和页大小。不能用普通SSD的最优chunk size直接指定HBF数据布局。”</p>"
+        },
+        {
+          "id": "paper-flint",
+          "title": "06｜FLINT · 2026预印本：围绕只读权重设计控制面",
+          "html": "<p><strong>抓住机制：</strong>动态合并小请求、利用Flash已有buffer、用冗余plane隐藏维护，再简化只读权重映射；评价采用trace-driven模拟。<a href=\"https://arxiv.org/html/2608.25062v1\" target=\"_blank\" rel=\"noopener\">原论文：第4–6节</a></p><p><strong>原创消融：</strong>保持GPU、总容量和权重布局相同，依次关掉请求合并、双buffer重叠、后台维护隔离。观察到底是有效读放大下降、总线空泡减少，还是P99停顿下降。只给总token/s看不出三者贡献。</p><p>再给出失败条件：同一page中请求不能合并，MoE路由使使用顺序变化，模型权重需要在线更新，或维护量超过冗余资源的吞吐。设计只读FTL可减少复杂度，但它是对工作负载的契约；换成通用显存后必须补回相关责任。</p><p><strong>评价数字时问：</strong>与HBM-only相比是否改变GPU数和跨卡同步？单卡装下模型的收益，不能全部归功于介质读取更快；基线因容量被迫多卡，是另一种架构收益来源。回答应把容量收益与单访问性能拆开。</p>"
+        },
+        {
+          "id": "paper-kvnegative",
+          "title": "07｜KV-Centric HBF · 2026预印本：识别“更快介质，系统更慢”",
+          "html": "<p><strong>抓住结论边界：</strong>研究用扩展TokenSim和trace测试特定KV卸载栈，完整HBF组织可能失利；比较还改变近端内存资源，作者明确未证明HBF介质孤立地输给SSD。<a href=\"https://arxiv.org/html/2608.11668v1\" target=\"_blank\" rel=\"noopener\">原论文：方法、第7节及局限</a></p><p><strong>原创推演：</strong>HBM缓存把最热prefix留下，远端层收到的恰好是很冷的尾部。总系统prefix命中率很高，HBF层自身却可能“一写几乎不读”。因此不能用整体命中率去论证Flash写入值得；要测每层conditional hit和reads-per-write。</p><p>面试官问“加速远端读有什么坏处”，可答它本身可能没有坏处，但实际方案往往同时花掉封装位置、HBM带宽、写功耗及软件预算。使用Amdahl检查：若远端读只占总时间5%，即使变成零，理想加速也仅1/0.95≈1.053。</p><p>最好的下一步实验不是争论HBF好坏，而是固定HBM资源、仅更改远端介质，再单独评估封装替换成本，分离因果。</p>"
+        },
+        {
+          "id": "paper-kvpositive",
+          "title": "08｜Characterizing HBF · 2026预印本：吞吐、TPOT与寿命一起看",
+          "html": "<p><strong>抓住方法：</strong>GPU kernel测量用于校准系统模型，HBF部分仍为外推；研究用分层放置和带缓存余量的调度探索高吞吐服务。明确的局限包括未完整建模商业HBF控制器与全部封装功耗，延迟受限小batch不在其主要范围。<a href=\"https://arxiv.org/html/2609.39131v1\" target=\"_blank\" rel=\"noopener\">原论文：方法及5.5节</a></p><p><strong>原创评审练习：</strong>方案A一小时完成100万token，但某用户P99 TPOT=200ms；B完成80万token，P99=40ms。若SLO为50ms，A不一定是好方案。请区分原始throughput、goodput、TTFT、TPOT与总完成时间，并给出相同请求到达轨迹下的结果。</p><p>寿命估算同样要注明P/E、均匀磨损和WAF前提。论文的理想假设可以作为可行性边界，不能改写成供应商承诺。把“WAF从1升到3”“维护写翻倍”“冷数据命中下降”列为敏感性实验，更能说明你理解存储工程。</p><p><strong>统一八篇的回答骨架：</strong>先解释数据为什么在移动，再解释哪段可以避免，接着列新增成本，最后说明验证方法与失败区间。不要用论文数量替代因果链。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "给你90秒讲一篇论文，应怎么组织？",
+          "answer": "用六句：具体负载和瓶颈；改变的位置或机制；减少哪段数据移动；付出什么面积/精度/布局/软件代价；实验是仿真还是实测及基线；在哪个条件下不成立。最后提出一个你会做的消融。",
+          "followups": [
+            "请用FLINT示范，不背摘要。"
+          ]
+        },
+        {
+          "q": "PIM原语快10倍，为何应用只快1.2倍？",
+          "answer": "可能原语覆盖率低，复制/转置/同步没有变快，或瓶颈转移到结果汇总。先用Amdahl估计理论上限，再分解端到端时间；单个kernel不能代表应用。",
+          "followups": [
+            "若只有20%时间可加速10倍，上限是多少？约1.22倍。"
+          ]
+        },
+        {
+          "q": "真实GPU上运行的HBF模拟器，是不是比纯模拟一定可信？",
+          "answer": "它保留了一部分真实计算与异步行为，但HBF仍依赖时序、温度、容量与访问覆盖模型。应检查注册访问比例、校准设备是否真HBF、注入开销以及外推范围，不能凭“真实GPU”四字跳过验证。",
+          "followups": [
+            "HBFSim用什么介质校准？",
+            "快模拟路径与参考路径如何对齐？"
+          ]
+        },
+        {
+          "q": "如何公平比较HBM-only和HBM+HBF？",
+          "answer": "先说明比较约束：同GPU数、同封装面积、同容量、同成本并不同时成立。固定工作负载/SLO，逐项报告资源与能耗；把容量导致的少卡收益、介质服务性能和软件调度收益分开。",
+          "followups": [
+            "如果一组8卡而另一组1卡，怎么解释吞吐和成本？"
+          ]
+        },
+        {
+          "q": "没有前沿项目经历，怎样讲这些论文不显得背书？",
+          "answer": "明确说这是论文学习和自主分析，不冒充真实研发经历。拿一个可复算的容量/带宽模型、一个反例、一个小实验设计讲完整；将自己GPU/架构背景连接到队列、数据布局、并行度和可验证取舍。",
+          "followups": [
+            "你能在两天内做哪个最小可验证实验？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "论文模拟新增容量让模型从多卡变成单卡，吞吐变好，可以直接归因HBF延迟更低吗？",
+          "options": [
+            "可以",
+            "不可以，应分离容量和跨卡通信因素"
+          ],
+          "correct": 1,
+          "explanation": "装得下带来的通信减少与介质单次访问速度是不同因果路径。"
+        },
+        {
+          "q": "转置6ms，PIM每次1ms，GPU每次3ms，输入布局可复用，至少做几次才严格更快？",
+          "options": [
+            "2次",
+            "3次",
+            "4次"
+          ],
+          "correct": 2,
+          "explanation": "6+k<3k要求k>3，4次时10ms<12ms。"
+        },
+        {
+          "q": "论文使用100k P/E、WAF=1估寿命，正确引用方式是？",
+          "options": [
+            "该HBF产品保证100k P/E",
+            "在论文假设下的外推寿命，需要对真实器件重新标定",
+            "WAF不会影响寿命"
+          ],
+          "correct": 1,
+          "explanation": "模拟假设与厂商保证不同，P/E、WAF、温度和磨损不均都影响寿命。"
+        }
+      ],
+      "sourceIds": [
+        "f12",
+        "f13",
+        "f14",
+        "f15",
+        "f16",
+        "f17",
+        "f18",
+        "f19",
+        "f20",
+        "f21",
+        "f22"
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "id": "f01",
+      "title": "What Designers Need to Know About HBM3",
+      "url": "https://www.synopsys.com/articles/hbm3-ip-dwtb.html",
+      "type": "official",
+      "year": 2022,
+      "venue": "Synopsys technical bulletin",
+      "evidence": "已读Channel Architecture及RAS：HBM3 16×64-bit channel、32×32-bit pseudo-channel、BL8；规格解释，不等于所有GPU实际效率。"
+    },
+    {
+      "id": "f02",
+      "title": "Micron HBM3E product information",
+      "url": "https://www.micron.com/products/memory/hbm/hbm3e",
+      "type": "official",
+      "year": 2026,
+      "venue": "Micron（网页检索于2026-10-30）",
+      "evidence": "官方产品口径：24GB 8-high/36GB 12-high、1024 I/O、16 channel/32 pseudo-channel、超过1.2TB/s；厂商产品指标。"
+    },
+    {
+      "id": "f03",
+      "title": "Micron HBM4 product information",
+      "url": "https://www.micron.com/products/memory/hbm/hbm4",
+      "type": "official",
+      "year": 2026,
+      "venue": "Micron（网页检索于2026-10-30）",
+      "evidence": "2048 I/O、12-high 36GB、16-high 48GB samples等产品状态；用于区分接口宽度、容量与堆叠高度。"
+    },
+    {
+      "id": "f04",
+      "title": "CoWoS advanced packaging",
+      "url": "https://3dfabric.tsmc.com/english/dedicatedFoundry/technology/cowos.htm",
+      "type": "official",
+      "year": 2026,
+      "venue": "TSMC 3DFabric（网页检索于2026-10-30）",
+      "evidence": "已读CoWoS-S/R/L结构：SoC与HBM通过硅/RDL/局部硅互连集成；2.5D封装不等于GPU上垂直叠HBM。"
+    },
+    {
+      "id": "f05",
+      "title": "What is NAND Flash Memory?",
+      "url": "https://www.kioxia.com/en-jp/rd/technology/nand-flash.html",
+      "type": "official",
+      "year": 2026,
+      "venue": "KIOXIA技术教育（检索于2026-10-30）",
+      "evidence": "已读储电薄膜、阈值电压读出、串联cell及掉电保持机制；非易失不等于无限保持。"
+    },
+    {
+      "id": "f06",
+      "title": "Managing Garbage Collection Operations Efficiently to Improve e-MMC and UFS Device Performance",
+      "url": "https://americas.kioxia.com/content/dam/kioxia/en-us/business/memory/mlc-nand/asset/KIOXIA_Efficient_Garbage_Collection_Operations_Tech_Brief.pdf",
+      "type": "official",
+      "year": 2024,
+      "venue": "KIOXIA technical brief",
+      "evidence": "已读6页技术说明：L2P、异地更新、有效页迁移、GC与WAF；文档例子不是所有设备的固定WAF。"
+    },
+    {
+      "id": "f07",
+      "title": "Micron FAQs — NAND ECC and read disturb",
+      "url": "https://www.micron.com/sales-support/sales/faqs",
+      "type": "official",
+      "year": 2026,
+      "venue": "Micron technical support（检索于2026-10-30）",
+      "evidence": "NAND问答证实ECC要求依器件而异、重复读引起read disturb、需刷新/迁移；不采旧产品速度作2026通用值。"
+    },
+    {
+      "id": "f08",
+      "title": "Sandisk and SK hynix Advance Global Standardization of HBF with First OCP Technical Specification",
+      "url": "https://www.sandisk.com/company/newsroom/press-releases/2026/2026-08-03-Sandisk-and-sk-hynix-advance-global-standardization-of-hbf",
+      "type": "official",
+      "year": 2026,
+      "venue": "Sandisk 2026-08-03官方公告",
+      "evidence": "首版技术规范发布、标准化工作组与参与者；发布标准不证明产品量产或独立性能实测。"
+    },
+    {
+      "id": "f09",
+      "title": "SK hynix Unveils First HBF Standard Specifications at FMS 2026",
+      "url": "https://news.skhynix.com/en/hbf-at-fms-2026/",
+      "type": "official",
+      "year": 2026,
+      "venue": "SK hynix 2026-08-04官方公告",
+      "evidence": "8/16-high NAND dies、最高512GB、约0.4–3.0TB/s三档、UCIe接口。数值属公布的规格范围，不拼成某现售单型号。"
+    },
+    {
+      "id": "f10",
+      "title": "Sandisk HBF Fact Sheet",
+      "url": "https://documents.sandisk.com/content/dam/asset-library/en_us/assets/public/sandisk/collateral/company/Sandisk-HBF-Fact-Sheet.pdf",
+      "type": "official",
+      "year": 2025,
+      "venue": "Sandisk July 2025 tech brief",
+      "evidence": "已读全部3页含脚注：256Gb/die、16-die 512GB、1.6TB/s为2025产品描述；2.2%结果限定Llama3.1 405B 8-bit权重和逐kernel性能模型，非通用实测。"
+    },
+    {
+      "id": "f11",
+      "title": "Memory-Centric AI: Sandisk’s High Bandwidth Flash Will Redefine AI Infrastructure",
+      "url": "https://www.sandisk.com/company/newsroom/blogs/2025/memory-centric-ai",
+      "type": "official",
+      "year": 2025,
+      "venue": "Sandisk roadmap blog",
+      "evidence": "2025公告提出HBF memory于2026下半年送样、推理设备2027年初送样的目标；截至检索不能据此断言目标已完成。"
+    },
+    {
+      "id": "f12",
+      "title": "FLINT: Efficiently Leveraging High Bandwidth Flash for Capacity-Scalable LLM Inference Acceleration",
+      "url": "https://arxiv.org/html/2608.25062v1",
+      "type": "paper",
+      "year": 2026,
+      "venue": "arXiv:2608.25062 v1，2026-08-25预印本",
+      "evidence": "已读机制4.1–4.4、方法5、评估6：trace-driven模拟、burst-buffer/phantom-plane/read-only FTL；不可当HBF硅实测。"
+    },
+    {
+      "id": "f13",
+      "title": "LLM in a flash: Efficient Large Language Model Inference with Limited Memory",
+      "url": "https://aclanthology.org/2024.acl-long.678.pdf",
+      "type": "paper",
+      "year": 2024,
+      "venue": "ACL 2024 Long Papers",
+      "evidence": "已读2–4节及实验/附录：普通flash到DRAM的稀疏权重加载、windowing和row-column bundling；真实平台实验，非HBF论文。"
+    },
+    {
+      "id": "f14",
+      "title": "Ambit: In-Memory Accelerator for Bulk Bitwise Operations Using Commodity DRAM Technology",
+      "url": "https://www.microsoft.com/en-us/research/wp-content/uploads/2017/09/MICRO-50_347.pdf",
+      "type": "paper",
+      "year": 2017,
+      "venue": "MICRO 2017",
+      "evidence": "已读TRA、NOT、临时行与命令序列、系统集成和评估：电路/架构仿真方案；不是通用DRAM现成指令。"
+    },
+    {
+      "id": "f15",
+      "title": "SIMDRAM: An End-to-End Framework for Bit-Serial SIMD Computing in DRAM",
+      "url": "https://people.inf.ethz.ch/omutlu/pub/SIMDRAM_asplos2021.pdf",
+      "type": "paper",
+      "year": 2021,
+      "venue": "ASPLOS 2021",
+      "evidence": "已读bit-serial映射、控制单元、系统集成、gem5方法和评估；SIMDRAM是仿真，CPU/GPU基线部分为真实测量。"
+    },
+    {
+      "id": "f16",
+      "title": "Benchmarking a New Paradigm: An Experimental Analysis of a Real Processing-in-Memory Architecture",
+      "url": "https://arxiv.org/pdf/2105.03814",
+      "type": "paper",
+      "year": 2021,
+      "venue": "arXiv:2105.03814；UPMEM真实系统研究",
+      "evidence": "已读DPU/WRAM/MRAM结构、微基准和第6节：真实UPMEM系统，适配简单运算且少跨DPU通信的负载；结果绑定当代配置。"
+    },
+    {
+      "id": "f17",
+      "title": "Samsung Develops Industry’s First High Bandwidth Memory with AI Processing Power",
+      "url": "https://news.samsungsemiconductor.com/global/samsung-develops-industrys-first-high-bandwidth-memory-with-ai-processing-power/",
+      "type": "official",
+      "year": 2021,
+      "venue": "Samsung 2021-02-17官方公告",
+      "evidence": "官方披露HBM-PIM在memory bank附近部署可编程计算能力；公布效果需绑定演示负载。"
+    },
+    {
+      "id": "f18",
+      "title": "Samsung SAIT PIMSimulator",
+      "url": "https://github.com/SAITPublic/PIMSimulator",
+      "type": "official",
+      "year": 2021,
+      "venue": "Samsung Advanced Institute of Technology官方开源实现",
+      "evidence": "已读架构、指令/模式及GEMV使用说明：CRF、GRF、bank row buffer、ADD/MUL/MAC/MAD；模拟器本身不是实片测量。"
+    },
+    {
+      "id": "f19",
+      "title": "Hardware Architecture and Software Stack for PIM Based on Commercial DRAM Technology: Industrial Product",
+      "url": "https://ieeexplore.ieee.org/document/9499894/",
+      "type": "paper",
+      "year": 2021,
+      "venue": "ISCA 2021 Industrial Product",
+      "evidence": "已核实会议官网及IEEE摘要书目；论文全文访问受限。本学习包细节依据Samsung公开实现和官方公告，不声称复现该论文全部实片结果。"
+    },
+    {
+      "id": "f20",
+      "title": "A Full-Stack Characterization of High-Bandwidth Flash for KV-Centric LLM Serving",
+      "url": "https://arxiv.org/html/2608.11668v1",
+      "type": "paper",
+      "year": 2026,
+      "venue": "arXiv:2608.11668 v1，2026-08-12预印本",
+      "evidence": "已读固定v1的4方法、7写流量、9.3局限：TokenSim及生产trace衍生模拟，比较完整架构同时改变近端容量/带宽；不能归纳成HBF介质必输SSD。2026-10-30复核arXiv已有v4（2026-09-14），标题增加HBF Sucks?；本教程的章节定位和分析仍对应所链v1，不混用新版数值。"
+    },
+    {
+      "id": "f21",
+      "title": "Characterizing High Bandwidth Flash for LLM Serving",
+      "url": "https://arxiv.org/html/2609.39131v1",
+      "type": "paper",
+      "year": 2026,
+      "venue": "arXiv:2609.39131 v1，2026-09-30预印本",
+      "evidence": "已读固定v1的3方法、4分层与调度、5结果局限：GPU kernel校准+HBF模拟；着重高吞吐；寿命依均匀磨损/WAF=1/100k P/E假设，非保证。2026-10-30复核arXiv已有v2（2026-10-05）；本教程分析对应所链v1，避免把新版摘要百分比与v1配置混合。"
+    },
+    {
+      "id": "f22",
+      "title": "HBFSim: Fast and Faithful Simulation of High-Bandwidth Flash Under Real GPU Execution",
+      "url": "https://arxiv.org/html/2609.09800v1",
+      "type": "paper",
+      "year": 2026,
+      "venue": "arXiv:2609.09800 v1，2026-09-09预印本",
+      "evidence": "已读固定v1的4机制及6.1–6.2：真实GPU执行但HBF为注入模型；校准flash/thermal设备为普通NVMe SSD；注册访问覆盖范围有限。2026-10-30复核arXiv已有v3（2026-09-30），论文与SlugLab/HBFSim官方代码仓库互链且题名一致；本教程中的具体校准/覆盖批评仅针对所链v1，不代替对新版代码的审计。"
+    }
+  ],
+  "papers": [
+    {
+      "id": "f-ambit",
+      "title": "Ambit: In-Memory Accelerator for Bulk Bitwise Operations Using Commodity DRAM Technology",
+      "year": 2017,
+      "venue": "MICRO 2017",
+      "url": "https://www.microsoft.com/en-us/research/wp-content/uploads/2017/09/MICRO-50_347.pdf",
+      "sourceId": "f14",
+      "modules": [
+        "pim",
+        "frontier-papers"
+      ],
+      "problem": "大位向量运算在外部处理器与DRAM之间搬运，受外部带宽限制。",
+      "mechanism": "借三行激活的多数函数与NOT原语组合bulk bitwise操作。",
+      "tradeoff": "专用行、复制和局部性约束；不是所有现成DRAM可直接执行。",
+      "evidence": "电路与架构层评估，不能当量产芯片实测。",
+      "interview": "若位图跨subarray，先估复制与分配成本；给出计算快而端到端收益小的反例。"
+    },
+    {
+      "id": "f-simdram",
+      "title": "SIMDRAM: An End-to-End Framework for Bit-Serial SIMD Computing in DRAM",
+      "year": 2021,
+      "venue": "ASPLOS 2021",
+      "url": "https://people.inf.ethz.ch/omutlu/pub/SIMDRAM_asplos2021.pdf",
+      "sourceId": "f15",
+      "modules": [
+        "pim",
+        "frontier-papers"
+      ],
+      "problem": "少量DRAM内逻辑原语如何系统化支持更复杂的运算。",
+      "mechanism": "逻辑综合、计算行分配与命令执行，配合bit-serial数据布局。",
+      "tradeoff": "位宽和复杂操作带来串行步骤；转置、复制、编程与系统集成都要计账。",
+      "evidence": "主要PIM方案用gem5/电路等建模，真实CPU/GPU基线不等于PIM硅已实现。",
+      "interview": "讲清可表达性与效率区别；用转置成本的摊薄阈值解释什么负载适合。"
+    },
+    {
+      "id": "f-samsung-pim",
+      "title": "Hardware Architecture and Software Stack for PIM Based on Commercial DRAM Technology: Industrial Product",
+      "year": 2021,
+      "venue": "ISCA 2021 Industrial Product",
+      "url": "https://ieeexplore.ieee.org/document/9499894/",
+      "sourceId": "f19",
+      "modules": [
+        "pim",
+        "frontier-papers"
+      ],
+      "problem": "存储厂商如何让bank附近计算接入已有主机体系。",
+      "mechanism": "官方实现展示寄存器、bank数据及内存命令驱动的数字运算流程。",
+      "tradeoff": "布局、广播、模式切换、同步和缓存可见性不能因接口复用而忽略。",
+      "evidence": "论文书目/摘要核验，全文访问受限；具体机制依据Samsung官方公告及PIMSimulator，未复现实片。",
+      "interview": "比较按矩阵行分片与列分片：分别需要输入广播还是partial-sum归约。"
+    },
+    {
+      "id": "f-upmem",
+      "title": "Benchmarking a New Paradigm: An Experimental Analysis of a Real Processing-in-Memory Architecture",
+      "year": 2021,
+      "venue": "arXiv:2105.03814；UPMEM真实系统研究",
+      "url": "https://arxiv.org/pdf/2105.03814",
+      "sourceId": "f16",
+      "modules": [
+        "pim",
+        "frontier-papers"
+      ],
+      "problem": "真实通用PIM系统能跑哪些应用，瓶颈在哪里。",
+      "mechanism": "用DPU微基准和应用测量拆解本地计算、内存及跨DPU通信。",
+      "tradeoff": "有限指令与算力、数据分发、host中转通信；结果依配置和负载。",
+      "evidence": "真实UPMEM平台实验；应区分kernel时间与包含传输的端到端时间。",
+      "interview": "构造过滤选择率改变及全局shuffle反例；不要从更多DPU推导线性加速。"
+    },
+    {
+      "id": "f-llm-flash",
+      "title": "LLM in a flash: Efficient Large Language Model Inference with Limited Memory",
+      "year": 2024,
+      "venue": "ACL 2024 Long Papers",
+      "url": "https://aclanthology.org/2024.acl-long.678.pdf",
+      "sourceId": "f13",
+      "modules": [
+        "nand",
+        "hbf",
+        "frontier-papers"
+      ],
+      "problem": "普通设备DRAM容量放不下模型，按需加载的Flash读成本过高。",
+      "mechanism": "近期神经元复用与连续权重布局，降低新增搬运并改善读粒度。",
+      "tradeoff": "模型稀疏性、预测成本/精度、DRAM缓存预算及布局重排限制可迁移性。",
+      "evidence": "ACL 2024真实平台实验；是普通Flash加载研究，不是HBF实测。",
+      "interview": "为什么多读一点连续数据可能更快？先比较数据量/有效带宽，再加入缓存容量。"
+    },
+    {
+      "id": "f-flint",
+      "title": "FLINT: Efficiently Leveraging High Bandwidth Flash for Capacity-Scalable LLM Inference Acceleration",
+      "year": 2026,
+      "venue": "arXiv:2608.25062 v1，2026-08-25预印本",
+      "url": "https://arxiv.org/html/2608.25062v1",
+      "sourceId": "f12",
+      "modules": [
+        "hbf",
+        "hbf-system",
+        "frontier-papers"
+      ],
+      "problem": "HBF权重容量层需要隐藏读延迟，且维护和通用FTL会带来额外成本。",
+      "mechanism": "动态burst合并、复用局部buffer、维护plane和只读映射特化。",
+      "tradeoff": "依赖权重读密集假设；映射、维护资源与运行时请求分布仍有限制。",
+      "evidence": "2026-08-25 arXiv v1；trace-driven系统模拟，非HBF器件实测。",
+      "interview": "用消融分开容量、合并、重叠和维护收益；说明什么时候只读特化不再适用。"
+    },
+    {
+      "id": "f-kv-centric",
+      "title": "A Full-Stack Characterization of High-Bandwidth Flash for KV-Centric LLM Serving",
+      "year": 2026,
+      "venue": "arXiv:2608.11668 v1，2026-08-12预印本",
+      "url": "https://arxiv.org/html/2608.11668v1",
+      "sourceId": "f20",
+      "modules": [
+        "hbf-system",
+        "frontier-papers"
+      ],
+      "problem": "直接把SSD式KV层换成更快Flash是否能自动提高服务质量。",
+      "mechanism": "完整服务trace与分层模型，检查近端资源损失、远端复用与写成本。",
+      "tradeoff": "比较包含HBM/GDDR资源变化；不能将完整架构负结果归因于单一介质。",
+      "evidence": "2026-08-12预印本，扩展TokenSim模拟；作者明确尚无商业HBF硅验证。",
+      "interview": "整体prefix命中率高，远端层为什么仍写多读少？分层条件命中率是关键。"
+    },
+    {
+      "id": "f-hbf-serving",
+      "title": "Characterizing High Bandwidth Flash for LLM Serving",
+      "year": 2026,
+      "venue": "arXiv:2609.39131 v1，2026-09-30预印本",
+      "url": "https://arxiv.org/html/2609.39131v1",
+      "sourceId": "f21",
+      "modules": [
+        "hbf-system",
+        "frontier-papers"
+      ],
+      "problem": "大容量HBF如何通过放置和调度转化为高吞吐服务收益。",
+      "mechanism": "HBM–HBF–host分层及预留KV增长空间的调度；比较权重/专家放置。",
+      "tradeoff": "吞吐与TPOT不等价；寿命依P/E、WAF及均匀磨损假设，模型不覆盖所有控制器和功耗。",
+      "evidence": "2026-09-30预印本；GPU kernel校准+HBF系统建模，主要面向高吞吐场景。",
+      "interview": "解释总完成时间改善但TPOT变差的情况，并以SLO goodput选择方案。"
+    }
+  ]
+}

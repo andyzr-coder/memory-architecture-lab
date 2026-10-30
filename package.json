@@ -1,0 +1,1 @@
+{"name":"memory-architecture-lab","version":"1.0.0","private":true,"description":"中文存储芯片架构学习文档与交互实验室","scripts":{"build":"node tools/build.cjs","test":"node tools/test-models.cjs && node tools/validate-content.cjs","start":"node tools/serve.cjs"}}

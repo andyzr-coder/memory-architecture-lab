@@ -1,0 +1,8 @@
+output/
+node_modules/
+*.log
+.openai/
+.DS_Store
+Thumbs.db
+TASK_STATE.md
+research/review-*.md

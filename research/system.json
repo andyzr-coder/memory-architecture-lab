@@ -1,0 +1,949 @@
+{
+  "modules": [
+    {
+      "id": "controller",
+      "title": "控制器与 PHY：把请求变成合法、高效的 DRAM 命令",
+      "group": "system",
+      "level": "core",
+      "minutes": 50,
+      "intro": "你熟悉 SoC/GPU 架构，可以把控制器看成同时懂业务优先级与 DRAM 时序的调度器。补齐的关键不是背命令缩写，而是能解释：同样的 DRAM，为什么换地址映射、请求次序或刷新策略，吞吐量和尾延迟会改变。",
+      "prerequisites": [],
+      "outcomes": [
+        "画出系统请求—控制器—PHY—DRAM 的边界",
+        "解释 row hit、bank 并行、调度公平性的冲突",
+        "给出读写切换和刷新调度的量化评估方案"
+      ],
+      "sections": [
+        {
+          "id": "controller-boundary",
+          "title": "1. 三个角色：决定先做什么、如何传过去、芯片如何响应",
+          "html": "<p><strong>控制器（memory controller）</strong>接收来自缓存/互连的读写请求，拆分地址、维护队列与 bank 状态，检查时序，安排 ACT、RD、WR、PRE、REF 等命令。还可能承担 QoS、写合并、错误处理与系统级 ECC。具体功能分布依 IP 而变。</p><p><strong>PHY（physical layer）</strong>处理高速电气接口：时钟与采样、串并转换、驱动与接收、延时校准等。训练会联合控制逻辑、PHY、固件与 DRAM；不能一概说全部在 PHY 或全部在控制器。DFI 规定控制器到 PHY 的接口，不等于 GPU 到控制器的协议，也不等于 DRAM 引脚接口。<a href=\"https://ddr-phy.org/\" target=\"_blank\" rel=\"noopener\">DFI 官方说明</a></p><p><strong>DRAM die</strong>执行阵列侧的译码、感应放大、恢复、列选择和刷新。在公开标准范围内，控制器知道发命令的合法条件；它通常不知道每个 cell 的真实模拟电压。架构提案必须明确是只改调度软件/控制器，还是要改芯片内部电路或接口。</p><pre>请求 → 地址映射 → 读/写队列 → 调度器 + 时序状态\n     → 命令/数据接口 → PHY → DRAM 引脚 → bank/子阵列\n返回数据 ← 响应重排、错误检查 ← PHY ← DRAM</pre>"
+        },
+        {
+          "id": "controller-mapping",
+          "title": "2. 地址映射：同一串字节，落到哪里很重要",
+          "html": "<p>物理地址需要拆成 channel、rank、bank group、bank、row、column、byte offset。排列不是全球统一公式，真实芯片还可能使用 XOR/hash。不要凭一张通用图声称某款 GPU 的 bank 位。</p><p>想象连续读取一大块张量。把较低位分给 channel/bank，能让相邻块分散到不同资源，扩大并行；把更多连续地址留在同一行，可以减少 ACT/PRE。两者不总同时最优：过度集中会产生热点，过度打散也可能失去行复用。stride 若恰好重复映射到少数 bank，会出现规律性带宽低谷。</p><p><strong>面试分析顺序：</strong>先说明请求粒度和映射，再说明每个 bank 的打开行，再数 row hit/conflict，最后考虑共享命令/数据总线和时序限制。不同 bank 能并行准备，不代表它们可以同时占用同一条数据总线。Rixner 的经典工作说明了为什么 DRAM 结构感知的重排能改善实际访问效率。<a href=\"https://groups.csail.mit.edu/cag/PSRG/papers/rixner_isca27.pdf\" target=\"_blank\" rel=\"noopener\">Memory Access Scheduling，§3–5</a></p>"
+        },
+        {
+          "id": "controller-latency",
+          "title": "3. 一次读的时间：先把队列与阵列拆开",
+          "html": "<p>端到端读延迟可以拆为互连时间、控制器排队、命令等待、阵列操作、数据传输与返回。行命中只是其中一段变短。<strong>hit</strong> 表示目标行已打开；<strong>closed-bank miss</strong> 表示没有打开行，要先 ACT；<strong>conflict</strong> 表示开着另一行，要先满足关闭条件，再 PRE、ACT。</p><p><strong>教学假设：</strong>令 tCL=tRCD=tRP=15 ns，忽略队列、burst 与其它约束；已满足可发命令条件。则首数据时间可粗算为 hit 15 ns、closed 30 ns、conflict 45 ns。若三者占比 60%/20%/20%，平均为 0.6×15+0.2×30+0.2×45=24 ns。这不是任何器件的规格，也不是完整 GPU load latency。</p><p>如果为了增加行命中，某请求在队列多等 100 ns，阵列侧节省 30 ns 仍可能得不偿失。反过来，让多个 bank 在一个请求等待 ACT 时准备其它请求，可提高吞吐量。<strong>命中率、吞吐量、平均延迟、p99 延迟要同时看。</strong></p>"
+        },
+        {
+          "id": "controller-policy",
+          "title": "4. FCFS、FR-FCFS 与 QoS：为什么“先服务行命中”不够",
+          "html": "<p>FCFS 倾向按到达次序服务，简单但可能出现队头阻塞。FR-FCFS 是 first-ready、first-come-first-served 思想：先利用已经可以执行的请求/命令，再按年龄打破平局；常见实现倾向可发出的行命中。<strong>“ready”必须满足时序和资源约束</strong>，不是看到相同行号就能发。不同实现对命令、请求、开行策略的组合会有差异。</p><p>假设流 A 不断访问当前打开行，流 B 的老请求需要换行。无限优先 A，平均带宽可能很好，B 却长期等待。可选补救包括年龄阈值、行命中批次上限、按来源限额、deadline 优先。代价是失去部分局部性、增加状态与仲裁逻辑；实时业务还需要可证明的最坏等待上界。</p><p>BLISS 提供一个很好的论文案例：用“同一来源连续被服务的次数”识别可能造成干扰的来源，暂时降低其优先级并周期恢复。它训练的是<strong>性能、公平性、实现复杂度一起优化</strong>的思路。GPU 多租户/多引擎可借鉴，但论文中的 CPU 工作负载和阈值不能直接移植。<a href=\"https://people.inf.ethz.ch/omutlu/pub/bliss-memory-scheduler_iccd14.pdf\" target=\"_blank\" rel=\"noopener\">BLISS，§III–V</a></p>"
+        },
+        {
+          "id": "controller-rw-refresh",
+          "title": "5. 读写切换与刷新：总线空转不都是程序问题",
+          "html": "<p>同一组 DQ 通常需要在读方向和写方向间切换，并遵守 turnaround 时序。频繁 R/W/R/W 会浪费可传数据的周期。控制器常把写请求暂存在队列中，达到阈值后批量 drain，再回到读优先。批次太小，切换多；太大，读请求尾延迟上升。写队列还要处理同地址相关性与可能的 forwarding。</p><p>刷新是保存电荷的必要操作，不能因为应用忙就无限延期。控制器可在标准允许窗口内调整时机，具体 all-bank、per-bank、same-bank 等支持取决于代际。<strong>教学假设：</strong>若每 7.8 μs 有一次 350 ns、完全不可重叠的暂停，简单占用率是 350/7800≈4.49%；实际损失还取决于流量、bank 并行、调度与温度，不能当作通用 DDR5/HBM 开销。</p><p>DARP 研究把刷新安排到更空闲的 bank 或写回阶段；SARP 进一步利用子阵列并行，但需要 DRAM 内部支持。这正好用来回答“只改控制器能做到哪一步”。<a href=\"https://people.inf.ethz.ch/omutlu/pub/dram-access-refresh-parallelization_hpca14.pdf\" target=\"_blank\" rel=\"noopener\">DARP/SARP 原论文</a></p>"
+        },
+        {
+          "id": "controller-training-validation",
+          "title": "6. 训练、验证与架构交付：不能只交一张带宽图",
+          "html": "<p>训练的目标是在工艺、电压、温度和走线差异下找到可靠收发窗口，例如调整采样相位、延迟、参考电压；支持项和流程随接口变化。训练成功解决“信号能否可靠收到”，不会自动解决低行命中、排队或 QoS。温度变化还可能触发重新校准或运行策略调整。</p><p>一个可评审控制器方案至少交付：地址映射、命令合法性状态机、调度优先级、刷新规则、队列大小/反压、请求顺序语义、超时与错误行为，以及工作负载和指标定义。读写同地址、队列满、刷新即将到期、极端 bank 热点等是边界场景。</p><p>Ramulator 2.0 将 DRAM 标准和控制器模块分开，适合研究策略变化。周期级模拟能检验时序/调度假设，但不会自动证明 PHY 信号完整性、晶体管电路或硅后良率。<a href=\"https://arxiv.org/pdf/2308.11030\" target=\"_blank\" rel=\"noopener\">Ramulator 2.0</a></p><p>术语速记：MC=内存控制器；PHY=物理层；FR-FCFS=优先就绪再按到达次序；QoS=服务质量；write drain=集中处理积压写请求；backpressure=资源不足时阻止上游继续注入。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "FR-FCFS 为什么可能伤害系统性能？",
+          "answer": "它通常能利用就绪请求和行局部性，但服务偏好可能让低局部性、低并行或延迟敏感流长期等待。我的评估会同时看吞吐量、每流 slowdown、p99 和饥饿上界；可用年龄优先或批次上限补救，再量化吞吐损失和仲裁成本。不能只拿总体 row-hit rate 证明方案更好。",
+          "followups": [
+            "你如何定义公平性？",
+            "设置年龄阈值会不会让高带宽流抖动？",
+            "如果队列深度翻倍，收益和代价是什么？"
+          ]
+        },
+        {
+          "q": "提高 bank 数一定会提高带宽吗？",
+          "answer": "不一定。它增加可重叠的阵列操作机会，但需要足够独立请求、合适映射和控制器队列；共享数据总线、bank-group 时序、ACT 功耗约束、命令总线仍可能限制吞吐。应先看瓶颈是阵列占用还是总线已饱和。",
+          "followups": [
+            "同 bank 不同子阵列能否并行？",
+            "tFAW 为什么是调度器必须知道的限制？"
+          ]
+        },
+        {
+          "q": "客户报告低带宽，你如何区分 PHY 与控制器问题？",
+          "answer": "先区分数据错误/训练降速与无错误但低利用率。确认实际运行速率、错误计数和训练状态，再统计队列、命令/数据总线占用、读写切换、刷新、行命中和 bank 分布。最后用连续流、随机流、单 bank 热点分别隔离接口与调度瓶颈。",
+          "followups": [
+            "训练通过是否意味着所有温度都稳定？",
+            "需要哪些硬件可观测计数器？"
+          ]
+        },
+        {
+          "q": "如何向面试官概括 DARP 与 SARP？",
+          "answer": "DARP 主要研究在允许刷新规则下优化刷新调度，利用 bank 间机会和写回阶段；SARP 更深入，利用同 bank 内子阵列的独立性让访问与刷新重叠，涉及内部组织支持。两者说明架构方案应明确控制器、协议和 DRAM 电路各改什么。",
+          "followups": [
+            "如何证明不会漏刷？",
+            "是否能不改 DRAM 就直接部署 SARP？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "同一 bank 打开的是另一行，读取目标行通常先需要什么？",
+          "options": [
+            "直接发 RD，硬件总能自动换行",
+            "在满足时序后 PRE，再 ACT 目标行，再 RD",
+            "只提高 PHY 采样频率"
+          ],
+          "correct": 1,
+          "explanation": "行冲突涉及关闭旧行与打开新行；还必须满足 tRAS、tRP、tRCD 等具体时序条件。"
+        },
+        {
+          "q": "哪项最能识别“带宽提升却牺牲交互业务”的调度问题？",
+          "options": [
+            "只看平均 row-hit rate",
+            "只看总完成字节数",
+            "同时看每流吞吐、p99 延迟与饥饿情况"
+          ],
+          "correct": 2,
+          "explanation": "总体平均数可能掩盖低局部性或低并行流的长期等待。"
+        },
+        {
+          "q": "DFI 主要定义哪条边界？",
+          "options": [
+            "控制器逻辑与 PHY",
+            "GPU warp 与 L1",
+            "NAND page 与 FTL"
+          ],
+          "correct": 0,
+          "explanation": "DFI 是控制器—PHY 接口规范；其版本和覆盖的存储类型需要明确。"
+        }
+      ],
+      "sourceIds": [
+        "sys01",
+        "sys02",
+        "sys03",
+        "sys04",
+        "sys05",
+        "sys06"
+      ]
+    },
+    {
+      "id": "gpu-memory",
+      "title": "GPU 访存：从 warp 事务一直追到 DRAM 行",
+      "group": "system",
+      "level": "core",
+      "minutes": 50,
+      "intro": "已有 GPU 架构基础时，最容易犯的错是把“访存合并、L2 命中、DRAM 行命中、bank 并行”混成一个概念。本章把它们放在不同层级，用流量、并行数与时序把它们连接起来。",
+      "prerequisites": [
+        "controller"
+      ],
+      "outcomes": [
+        "区分合并事务、缓存行、DRAM burst 和 row buffer",
+        "用带宽—延迟积估算所需并发",
+        "用 Roofline 和 FlashAttention 解释软硬件取舍"
+      ],
+      "sections": [
+        {
+          "id": "gpu-path",
+          "title": "1. 先画路径，再问“哪一级在等”",
+          "html": "<pre>warp 的 load/store\n→ 地址生成与转换（TLB 等）\n→ 合并访问 / L1 路径\n→ 片上互连 → L2 slice / memory partition\n→ 内存控制器队列 → PHY → DRAM channel/bank/row\n→ 数据沿返回路径唤醒依赖指令</pre><p>这是通用学习框架；cache bypass、原子操作、异步 copy、具体 slice 与 controller 的连接依芯片变化。Hopper 官方架构展示了 SM、L2 与 HBM 控制器分工，但没有公开每个地址位如何映射到 bank。不要把微基准推测说成厂商规格。<a href=\"https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/\" target=\"_blank\" rel=\"noopener\">NVIDIA Hopper 架构说明</a></p><p>一条 load 慢，可能在 TLB、cache miss、互连拥塞、控制器排队、行冲突或数据返回上。先定位层级，才知道应改内核布局、缓存策略、分区映射还是 DRAM。软件能观察的只是其中一部分。</p>"
+        },
+        {
+          "id": "gpu-coalescing",
+          "title": "2. Coalescing：把很多小需求装进尽可能少的运输单元",
+          "html": "<p>warp 内线程的一次全局访存指令会合并地址请求。以 NVIDIA 文档的 32 B 事务口径为例，32 个线程各读 4 B，总有效数据 128 B；若覆盖四个对齐 32 B 段，只需四个事务。线程编号与地址无需严格单调，只要落在这些段内，置换也可合并。<a href=\"https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html\" target=\"_blank\" rel=\"noopener\">CUDA：Coalesced Global Memory Access</a></p><p><strong>教学推导：</strong>若每个线程落在不同 32 B 段，32 个事务共 1024 B，当前指令只使用 128 B，有效比例 12.5%。若相邻线程连续读，但起点偏移 4 B，覆盖五段，则为 128/160=80%。这是事务利用率，不能直接断言执行时间变成 8 倍或 1.25 倍，因为缓存、并发与其它瓶颈会改变结果。</p><p><strong>合并不等于行命中。</strong>合并发生在 GPU 请求侧；DRAM 行命中取决于更下游地址映射和打开行状态。一个 32 B sector 也不一定对应一次独立 DRAM 命令：L2 可能命中、合并或按器件 burst 粒度处理请求。</p>"
+        },
+        {
+          "id": "gpu-parallelism",
+          "title": "3. MLP、BLP、row locality：三种不同的“好访存”",
+          "html": "<table><thead><tr><th>概念</th><th>它解决什么</th><th>为何不能互相替代</th></tr></thead><tbody><tr><td>MLP：memory-level parallelism</td><td>同时有多个独立访问在飞，隐藏延迟</td><td>若全部落到一个忙 bank，未必有高吞吐</td></tr><tr><td>BLP：bank-level parallelism</td><td>多个 bank 的阵列准备工作重叠</td><td>仍可能共享命令/数据总线，也需要足够请求</td></tr><tr><td>Row locality：行局部性</td><td>复用已打开行，减少切换</td><td>集中在少数 bank 可能降低并行或公平性</td></tr><tr><td>Coalescing：访问合并</td><td>减少无用事务字节</td><td>不保证下游有高行命中或高 BLP</td></tr></tbody></table><p><strong>教学假设：</strong>整个 GPU 想持续达到 3 TB/s，平均内存服务时间为 300 ns。稳定状态的在途数据量约为 BW×latency=900,000 B。若用每项 128 B 的等效请求计数，至少约 7032 项在途；这只是 Little 定律量级估计，不是某 GPU 的真实队列深度。缓存命中、请求合并和各层排队会改变口径。</p><p>单条指针链每次要先收到地址才能发下一次请求，依赖限制 MLP，即使峰值带宽很高也用不起来。多个独立 warp/访问链能帮助，但当接口已经饱和，再增加并发主要是延长队列。</p>"
+        },
+        {
+          "id": "gpu-latency-hiding",
+          "title": "4. Occupancy 是资源条件，不是“带宽使用率”",
+          "html": "<p>更多驻留 warp 提供更多可调度任务，某 warp 等数据时可以发另一个。但能否隐藏延迟，还取决于就绪指令数量、warp 内依赖、寄存器与 shared memory 占用、未完成请求额度、同步与 cache 行为。高 occupancy 的 kernel 也可能所有 warp 一起卡在同一个依赖上。</p><p>反过来，合理增加每线程工作量或使用较大的 tile，可能提高寄存器占用、降低 occupancy，却减少全局流量而更快。异步 copy/双缓冲让下一块数据搬运与当前计算重叠；前提是未来地址可知、缓冲足够、搬运资源有余量，并且同步正确。</p><p>调优时分别观察有效带宽、实际 DRAM 流量、L2 命中、活跃/就绪 warp、stall 原因。不要把 profiler 的某一个百分比当成全部事实。Nsight Compute 的 replay 与缓存清理会影响测量，比较时必须保持设置一致。<a href=\"https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html\" target=\"_blank\" rel=\"noopener\">Nsight Compute Profiling Guide</a></p>"
+        },
+        {
+          "id": "gpu-roofline",
+          "title": "5. Roofline：先判断该加算力、加带宽，还是减少字节",
+          "html": "<p>选定同一个存储层级，令 I=运算次数/该层传输字节，计算上限 P，持续带宽 B，则性能上界为 <code>min(P, B×I)</code>。Roofline 是上界工具，不是保证达到的预测器；串行依赖、调度、同步等还能把性能压到更低。原始工作也强调用经过缓存过滤的内存流量，并允许建立 L2 等不同层级模型。<a href=\"https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.pdf\" target=\"_blank\" rel=\"noopener\">Roofline 原始报告</a></p><p><strong>教学假设：</strong>P=120 TFLOP/s，持续 HBM 带宽 B=3 TB/s，拐点 I*=40 FLOP/B。若 kernel 的 I=4，带宽屋顶只有 12 TFLOP/s；把计算单元翻倍基本无助。若通过数据复用将 I 提高到 20，屋顶升至 60 TFLOP/s；能否达到，还要看实际发射与并行。</p><p>注意单位与精度：FMA 通常计 2 FLOP；不能把 FP8 稀疏峰值放到 BF16 稠密 kernel 的屋顶上；也不能用“理论最低字节数”计算 I，却用含重复搬运的实测性能作不一致比较。报告应同时给理想流量、实际计数器流量和差距原因。</p>"
+        },
+        {
+          "id": "gpu-flashattention",
+          "title": "6. FlashAttention 与 PagedAttention：两种不同的节省",
+          "html": "<p>普通 attention 若把 QKᵀ 和 softmax 结果完整写回外存，会产生大的中间流量。FlashAttention 按块搬入片上 SRAM，用在线 softmax 的最大值/归一化统计合并分块结果；反向可以重算部分中间值。其核心是减少 HBM 往返，保持标准 attention 的数学结果，并不意味着把密集注意力的算术复杂度变为线性。<a href=\"https://arxiv.org/pdf/2205.14135\" target=\"_blank\" rel=\"noopener\">FlashAttention，§3</a></p><p><strong>教学推导：</strong>N=8192 时，仅一张 FP16 的 N×N 中间矩阵就占 128 MiB；32 个 head 若同时完整存储这类矩阵，就是 4 GiB。分块避免完整物化它，不代表 KV cache 也消失。tile 太大还会挤占片上资源，减少并发。</p><p>PagedAttention 管理的是不断增长的 KV cache：逻辑连续的 token 可以映射到不连续的物理块，减少预留浪费并支持共享。块小有利于减少碎片，块大可能利于执行和传输效率。它是软件分配/访问机制，不是 DRAM 行缓冲优化。<a href=\"https://arxiv.org/html/2309.06180v1\" target=\"_blank\" rel=\"noopener\">PagedAttention，§4、§7</a></p><p>面试应说清三层区别：FlashAttention 减少算子的中间 I/O；PagedAttention 改善 KV 管理；DRAM 控制器负责最终到达设备的请求次序。三者可以组合，但某层提升不一定线性传到端到端。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "访存已经 coalesced，为什么带宽还很低？",
+          "answer": "合并只说明同一条 warp 指令的事务利用率。还要检查工作集是否命中缓存、是否有足够 MLP、分区/bank 是否热点、读写和刷新开销、以及 load 是否受依赖或同步限制。先用计数器区分流量不足与服务效率低，再设计微基准隔离。",
+          "followups": [
+            "连续访存是否保证高 row-hit rate？",
+            "如何区分 cache 带宽与 HBM 带宽？"
+          ]
+        },
+        {
+          "q": "为什么更多 warp 有时反而更慢？",
+          "answer": "增加并发能隐藏延迟，但也会增加寄存器、缓存和队列竞争。达到吞吐上限后，更多请求主要延长排队；如果工作集相互驱逐，还会放大流量。应该扫描 block size/驻留资源并观察性能与缓存流量，而不是追求最大 occupancy。",
+          "followups": [
+            "你如何判断已经超过有用并发点？",
+            "为什么大 tile 降低 occupancy 却仍能加速？"
+          ]
+        },
+        {
+          "q": "FlashAttention 对存储芯片架构有什么启发？",
+          "answer": "先减少需要跨层移动的数据，再讨论提高接口带宽。它用片上空间、分块和部分重算换取更少 HBM 中间读写。对芯片设计的启发是联动片上 SRAM 容量、带宽、并发、异步搬运与外存配置，而不是只比较 FLOPS。",
+          "followups": [
+            "它是否让 attention 变成 O(N) 运算？",
+            "它是否消除了 decode 的 KV 读取？"
+          ]
+        },
+        {
+          "q": "一块 3 TB/s GPU 是否能在 1 ns 内读完 3 KB？",
+          "answer": "3 TB/s 描述足够并发下的长期传输速率，不是一次请求首数据延迟。单请求仍有地址转换、排队、阵列和返回开销；只有大量独立访问流水起来，平均速率才可能接近带宽上限。",
+          "followups": [
+            "带宽—延迟积在这里有什么用？",
+            "小粒度随机读为什么尤其需要并发？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "32 个线程各读 4 B，覆盖 5 个 32 B 段，按事务口径有效比例是多少？",
+          "options": [
+            "100%",
+            "80%",
+            "12.5%"
+          ],
+          "correct": 1,
+          "explanation": "有效 128 B，传输 160 B，128/160=80%；这不是端到端性能百分比。"
+        },
+        {
+          "q": "某 kernel 低于 HBM Roofline 很远，最合理的下一步是？",
+          "options": [
+            "直接判定需要更多 HBM",
+            "检查依赖、MLP、发射和实际流量等额外上限",
+            "认为 Roofline 公式失效"
+          ],
+          "correct": 1,
+          "explanation": "Roofline 是上界，不包含所有串行性和资源约束。"
+        },
+        {
+          "q": "FlashAttention 的主要价值是什么？",
+          "options": [
+            "消除所有 KV cache",
+            "把标准密集 attention 的运算量变成线性",
+            "利用片上分块等方式减少 HBM 中间 I/O"
+          ],
+          "correct": 2,
+          "explanation": "减少外存中间数据往返与存储是核心；标准 attention 仍有其算术量，KV cache 是另一类状态。"
+        }
+      ],
+      "sourceIds": [
+        "sys07",
+        "sys08",
+        "sys09",
+        "sys10",
+        "sys11",
+        "sys17"
+      ]
+    },
+    {
+      "id": "memory-products",
+      "title": "存储产品地图：DDR、LPDDR、GDDR、HBM、SRAM 与 NAND",
+      "group": "system",
+      "level": "core",
+      "minutes": 40,
+      "intro": "面试中的“熟悉存储芯片架构或应用方案”通常会从选型切入。最好的回答是先识别数据的容量、访问与可靠性需求，再选择存储介质、组织、接口和封装，而不是背一个从慢到快的排行榜。",
+      "prerequisites": [],
+      "outcomes": [
+        "区分介质、接口标准、封装与系统产品",
+        "根据工作负载选择内存类型并解释代价",
+        "正确计算容量、引脚带宽、有效带宽和功耗预算"
+      ],
+      "sections": [
+        {
+          "id": "products-taxonomy",
+          "title": "1. 四层分类，避免把 SSD 与 DRAM 放错位置",
+          "html": "<p><strong>介质层：</strong>SRAM、DRAM、NAND 决定基本存储机制。<strong>组织层：</strong>bank、row、page、channel 等定义访问并行和粒度。<strong>接口/协议层：</strong>DDR、LPDDR、GDDR、HBM 或 NAND 接口约定如何交互。<strong>封装/系统层：</strong>DIMM、堆叠器件、SSD 等把芯片和控制逻辑组合成产品。</p><p>DDR、LPDDR、GDDR、HBM 都属于 DRAM 家族路线，仍需面对感应、恢复、刷新和阵列时序。HBM 的“堆叠”和 NAND 的“3D 单元层数”也不是同一维度。HBF 基于 NAND，不能因为名字与 HBM 接近就把它当 DRAM。</p><table><thead><tr><th>类别</th><th>核心长处</th><th>主要约束</th><th>典型位置</th></tr></thead><tbody><tr><td>SRAM</td><td>低访问延迟，适合高频小容量访问</td><td>每 bit 面积与漏电成本高</td><td>寄存器附近、cache、片上缓冲</td></tr><tr><td>DRAM</td><td>容量、成本、可重写性能较均衡</td><td>刷新、行操作与外部接口</td><td>系统内存、GPU 工作内存</td></tr><tr><td>NAND</td><td>高密度、非易失</td><td>页/块粒度、写擦除与寿命、ECC</td><td>存储、分层容量、HBF 候选数据层</td></tr></tbody></table>"
+        },
+        {
+          "id": "products-ddr",
+          "title": "2. DDR：通用主存是系统工程，不只是数据率",
+          "html": "<p>标准 DDR 常用于通用计算的系统内存，DIMM 生态方便配置容量和维护。但芯片、rank、module、channel 是不同实体：多个 x8 die 可以组成更宽的数据接口；增加 rank 不等于增加独立数据总线。控制器需在容量扩展、负载、速率与可靠性之间取舍。</p><p><strong>教学计算：</strong>假设一个总数据宽度 64 bit 的 DDR 接口工作在 6400 MT/s，原始数据带宽是 6400×10⁶×64/8=51.2 GB/s。6400 MT/s 已经表示每秒传输次数，不能再乘 2。若系统是两个 32 bit 数据子通道，把它们分别相加即可；ECC 额外位不应算成应用有效数据。</p><p>真实有效带宽还会扣除命令/时序空隙、刷新、读写切换、低局部性和不满载因素。可写为 <code>有效带宽≈原始带宽×利用率</code>，但利用率必须来自明确工作负载的测量或模型。厂商的标准分类资料有助于建立框架，其旧代际路线图不应用于当前选型。<a href=\"https://www.synopsys.com/dw/doc.php/wp/which_DDR_SDRAM_memory_to_use_and_when_LI.pdf\" target=\"_blank\" rel=\"noopener\">Synopsys 内存选型白皮书</a></p>"
+        },
+        {
+          "id": "products-lpddr",
+          "title": "3. LPDDR：功耗与系统形态优先，不等于“低性能 DDR”",
+          "html": "<p>LPDDR 面向严格功耗与紧凑系统设计，低功耗状态、供电、时钟及接口组织都很重要。判断优势要分活跃能耗、待机功耗、唤醒延迟、整板布线和封装。手机/边缘系统常关注每个任务能量与待机续航，服务器也可能采用 LPDDR 技术满足容量和能效需求。Micron 官方资料同时列出了移动和数据中心应用。<a href=\"https://www.micron.com/products/memory/lpddr-components/lpddr5x\" target=\"_blank\" rel=\"noopener\">Micron LPDDR5X</a></p><p>因此，“LPDDR 只用于手机”“LPDDR 一定比 DDR 延迟低”都不稳妥。需要指定代际、速率、拓扑、功耗状态和请求类型。进入更深睡眠可以节能，却可能增加恢复等待；持续流量高时，待机优势也不等于相同幅度的整机功耗下降。</p><p><strong>教学假设：</strong>总数据宽 256 bit、8 GT/s，则原始带宽为 256 GB/s。扩大通道数可以提高带宽，也增加 PHY、封装引脚和布线资源。低功耗产品依然要计算真实业务需要多少吞吐量。</p>"
+        },
+        {
+          "id": "products-gddr-hbm",
+          "title": "4. GDDR 与 HBM：提高单线速率，还是铺更多短连线",
+          "html": "<p>GDDR 常借助较高的每引脚数据率和板级多个器件供给图形/计算带宽；HBM 借助堆叠和宽接口、短距离封装互连供给高总带宽。两者都不是“无延迟内存”。HBM 仍包含 DRAM 阵列操作，GDDR 也可能满足某些 AI 系统的成本和容量目标。</p><p><strong>教学对比，非当代产品规格：</strong>256 bit×20 Gb/s÷8=640 GB/s；1024 bit×6.4 Gb/s÷8=819.2 GB/s。第二种方案的单线速率低，总带宽却高。不能由这个算式直接得出成本或总功耗结论，还要加控制器/PHY、封装、堆叠数量、热和良率。</p><p>HBM 的高接口并行需要 GPU/加速器有足够通道、队列与请求；堆叠更高首先改变容量和热/制造约束，不会自动让带宽按 die 数同比增长。Hopper 的官方说明也把 HBM 控制器和 L2 明确列为独立架构资源。<a href=\"https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/\" target=\"_blank\" rel=\"noopener\">Hopper 架构资源</a></p>"
+        },
+        {
+          "id": "products-sram-nand-hbf",
+          "title": "5. SRAM、NAND 与 HBF：容量层级为什么不能随便互换",
+          "html": "<p>典型 SRAM 单元用交叉耦合电路保持状态，在供电保持时无需 DRAM 式周期刷新，适合低延迟工作集；典型 DRAM 以电容存一位，密度更高但需恢复与刷新。不是所有 SRAM 都必须是 6T，也不是“片上”一定等于 SRAM：应分清常见实现和定义。</p><p>NAND 以页/块组织数据，读、编程、擦除的粒度和时间不对称，需要错误校正、坏块管理和寿命管理。SSD 还包含控制器、映射、缓存等系统机制，所以 NAND 芯片延迟不能直接等于 NVMe SSD 延迟。<a href=\"https://onlinedocs.microchip.com/oxy/GUID-87101AE8-6003-4D1F-B624-895C158CCD3E-en-US-1/GUID-F3BE160C-4AEC-4F0A-92A7-39025FDDEE0B.html\" target=\"_blank\" rel=\"noopener\">Microchip NAND 组织说明</a></p><p>HBF 的方向是让 NAND 提供更靠近加速器、更高并行的容量层；厂商将其面向 AI 推理。即使总读带宽很高，也不能推导细粒度随机首访问与 HBM 相同，更不能无条件把高频写入 KV 直接搬过去。可优先研究相对只读、可分块预测的权重；KV 的读写频率、生命周期和预取难度要单独评估。<a href=\"https://documents.sandisk.com/content/dam/asset-library/en_us/assets/public/sandisk/collateral/company/Sandisk-HBF-Fact-Sheet.pdf\" target=\"_blank\" rel=\"noopener\">Sandisk HBF 技术简介（2025）</a></p>"
+        },
+        {
+          "id": "products-spec",
+          "title": "6. 从应用需求倒推产品规格：别只交“容量＋带宽”",
+          "html": "<ol><li><strong>容量：</strong>常驻权重、KV/工作状态、临时 workspace、元数据、碎片和安全余量。</li><li><strong>吞吐：</strong>每次任务实际经过接口的字节数×任务速率；区分读写和瞬时峰值。</li><li><strong>延迟：</strong>平均与 p99、首次响应与稳态响应、最坏热点与混合业务。</li><li><strong>功耗/热：</strong>活跃和空闲、I/O 与阵列、refresh，以及堆叠温度对运行的影响。</li><li><strong>成本/面积：</strong>die、PHY、封装、测试、良率、容量扩展方式；没有工艺与设计数据时不编造 mm²。</li><li><strong>可靠性：</strong>ECC 覆盖范围、错误上报、修复、保持与寿命；on-die ECC 不能自动代替端到端保护。</li></ol><p><strong>教学能量预算：</strong>假设链路每传 1 bit 花 3 pJ，持续传 1 TB/s，则仅该口径动态功率为 8×10¹²×3×10⁻¹²=24 W。这里没有计阵列、静态、刷新与控制器。不同论文的 pJ/bit 若边界不同，不能直接比较。</p><p>JEDEC 标准用于约定互操作所需的组织、命令、时序、电气和状态行为等；具体产品可能只支持其中部分等级，内部实现也不由一个接口名称完全决定。产品规格应同时给标准版本、器件料号/配置、目标工作负载和验证条件。不要把某标准最高数据率当所有器件的保证值。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "客户要做 AI 推理，为什么不直接全部上 HBM？",
+          "answer": "先算能否满足容量、实际带宽和尾延迟，再比较功耗、封装成本和供应配置。HBM 很适合高带宽工作层，但容量成本与封装资源可能限制规模；若工作集可分层且访问可预测，可研究更大容量层。选型应给可验证的数据放置与迁移方案，不能只按峰值排名。",
+          "followups": [
+            "HBM 堆栈数减少会影响什么？",
+            "权重与 KV 是否适合相同存储层？"
+          ]
+        },
+        {
+          "q": "如何比较 DDR、LPDDR、GDDR、HBM 的功耗？",
+          "answer": "必须对齐系统边界和工作负载：同容量还是同带宽、活跃还是待机、是否包括控制器和封装、实际利用率多少。然后比较每任务能量和热约束。只抄不同资料里的 pJ/bit 不能得出整机能效结论。",
+          "followups": [
+            "工作量低时哪类能耗占比会上升？",
+            "带宽翻倍但 pJ/bit 降低，总功率一定降低吗？"
+          ]
+        },
+        {
+          "q": "HBM 与 HBF 最根本的差别是什么？",
+          "answer": "HBM 属于 DRAM，HBF 基于 NAND。接口总读带宽相似不意味着访问粒度、首数据延迟、写入/擦除、寿命或可预测性相同。需要把 HBF 看成待评估的新层级，并明确哪些数据驻留 HBM、哪些可提前搬运。",
+          "followups": [
+            "为什么小粒度随机读是关键测试？",
+            "KV cache 更新会带来什么问题？"
+          ]
+        },
+        {
+          "q": "DDR 接口 64 bit、6400 MT/s 为什么是 51.2 GB/s？",
+          "answer": "每次传 64/8=8 B，每秒 6.4×10⁹ 次，相乘为 51.2×10⁹ B/s。MT/s 已计传输次数，不再乘 DDR 的 2；这也只是原始数据接口带宽，应用有效带宽会更低。",
+          "followups": [
+            "若包含 ECC 位怎么办？",
+            "若模块拆成两个 32 bit 子通道怎么办？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "下列哪一组都属于 DRAM 路线？",
+          "options": [
+            "DDR、LPDDR、GDDR、HBM",
+            "SRAM、HBM、NVMe",
+            "NAND、GDDR、HBF"
+          ],
+          "correct": 0,
+          "explanation": "NVMe 是协议层，HBF 基于 NAND，SRAM 是不同介质。"
+        },
+        {
+          "q": "HBM 堆叠 die 数翻倍，可以直接推出什么？",
+          "options": [
+            "带宽必然翻倍",
+            "首数据延迟必然减半",
+            "应重新计算容量与组织；带宽需看接口等约束"
+          ],
+          "correct": 2,
+          "explanation": "容量、接口并行、速率和内部组织是相关但不同的维度。"
+        },
+        {
+          "q": "1 TB/s 链路按 3 pJ/bit 估算的动态功率是多少？",
+          "options": [
+            "3 W",
+            "24 W",
+            "24 mW"
+          ],
+          "correct": 1,
+          "explanation": "1 byte=8 bit，所以 1×10¹²×8×3×10⁻¹²=24 W；未包含其它能耗。"
+        }
+      ],
+      "sourceIds": [
+        "sys08",
+        "sys12",
+        "sys13",
+        "sys14",
+        "sys18"
+      ]
+    },
+    {
+      "id": "architecture-case",
+      "title": "架构案例：给 70B 推理设计一份能被评审的存储规格",
+      "group": "system",
+      "level": "advanced",
+      "minutes": 65,
+      "intro": "这是一道完整的教学产品定义题。所有器件容量、带宽、效率和预算都是明确假设，不对应某款真实芯片。目标是练习从服务指标推导存储组织，并主动指出模型的适用范围。",
+      "prerequisites": [
+        "controller",
+        "gpu-memory",
+        "memory-products"
+      ],
+      "outcomes": [
+        "独立推导权重与 KV cache 容量",
+        "区分 prefill、decode、每用户延迟与总吞吐",
+        "给出容量/带宽/功耗/质量多约束方案和验收方法"
+      ],
+      "sections": [
+        {
+          "id": "case-workload",
+          "title": "1. 先定义负载和 SLA，再选存储",
+          "html": "<p><strong>教学需求：</strong>一个稠密 70B 参数模型，BF16 权重，每个参数 2 B；80 层，8 个 KV head，head dimension=128，KV 用 BF16；batch=8，每请求当前上下文 8192 token。目标稳态每用户 30 token/s，即一次 decode step 同时为 8 个用户各生成一个 token，step 约不超过 33.3 ms，总吞吐 240 token/s。暂不计多卡通信。</p><p>BF16 是数值格式，不代表硬件一定以相同速度处理所有算子。80 层和 8 个 KV head 是本题配置，不能从“70B”三个字符自动推导。GQA 的多个 query head 共享较少 K/V head，因此 KV 容量应使用 KV head 数。<a href=\"https://aclanthology.org/2023.emnlp-main.298.pdf\" target=\"_blank\" rel=\"noopener\">GQA 原论文，§2</a></p><p>真实需求还要补：最大上下文、输入/输出长度分布、并发变化、TTFT（首 token 时间）、ITL/TPOT（生成阶段 token 间隔）、p99、质量阈值与功耗。平均 240 token/s 不等于每个用户都达到 30 token/s。</p>"
+        },
+        {
+          "id": "case-capacity",
+          "title": "2. 权重和 KV：把每个因子写出来",
+          "html": "<p>权重容量 <code>Cw=P×bytes_per_parameter</code>。70×10⁹×2=140 GB≈130.4 GiB。若理想 INT8 为 70 GB、理想 INT4 为 35 GB；实际还要计 scale、zero point、padding、可能保持高精度的层等，不能把裸位数当部署文件大小。</p><p>普通 MHA/GQA 的 KV 容量近似为 <code>Ckv=2×L×B×S×Hkv×D×bytes</code>。前面的 2 是 K 和 V。按本题：2×80×8×8192×8×128×2=21,474,836,480 B=20 GiB≈21.47 GB。每请求每 token 为 320 KiB，每请求 8192 token 为 2.5 GiB。</p><p>若把 KV head 从 8 改成 64，其它不变，KV 就变成 160 GiB；它不是“同一个模型免费开关”，模型结构/质量也要处理。若上下文翻倍，KV 容量近似翻倍；权重不随 batch 或上下文同步增长。</p><p><strong>容量预算假设：</strong>另留 16 GB 给 workspace、运行时和暂定余量，则当前需求为 140+21.47+16=177.47 GB。若设计容量 192 GB，剩约 14.53 GB；它还不是可接受的最大服务规模，长尾上下文、动态 batch 和碎片需要再验算。PagedAttention 可以减少分配浪费，但不会改变每个有效 KV 元素本身的字节数。<a href=\"https://arxiv.org/html/2309.06180v1\" target=\"_blank\" rel=\"noopener\">PagedAttention，§3–4</a></p>"
+        },
+        {
+          "id": "case-bandwidth",
+          "title": "3. Decode 带宽：一次权重读取服务多少 token",
+          "html": "<p><strong>一阶模型：</strong>每 step 所有权重从外存读一次并在 batch 内共享；完整 dense attention 读取当前所需 KV 一次；先忽略激活、小张量、写回、重复读取和通信。则每 step 数据约为 140+21.47=161.47 GB。达到 33.3 ms，持续有效带宽至少约 4.84 TB/s。这是乐观下限，不能直接承诺 SLA。</p><p>若已知原始带宽到有效业务流量的效率仅 75%，原始接口至少约 6.46 TB/s，并且仍无计算、串行与 p99 余量。把 161.47 GB 除以 batch=8，可得每个输出 token 平均分摊约 20.18 GB；绝不能把每用户 token/s 与全模型每 step 流量混乘。</p><p>batch 增大能摊薄每 token 权重读取，但 KV 容量和 KV 总读流量也增长。长上下文、低位权重、大 batch 下，KV 占比可能显著上升。只有在测到负载的真实外存字节后，才能修正这个一阶模型。</p>"
+        },
+        {
+          "id": "case-prefill",
+          "title": "4. Prefill 与 decode：同一模型，瓶颈会换",
+          "html": "<p>Prefill 一次处理较多输入 token，可形成较大的矩阵计算，提高权重复用；长序列 attention 也有大量计算与 I/O。Decode 每序列通常只前进一步，batch 小时更像低复用矩阵向量计算，并反复读取权重/KV。它们“常见的倾向”不同，不能不看形状就断言所有 prefill 算力受限、所有 decode 带宽受限。</p><p><strong>教学计算：</strong>用稠密网络粗略估计每 step 主要线性层运算为 2PB=1.12×10¹² FLOP；若这类算子的有效算力为 200 TFLOP/s，计算时间量级是 5.6 ms。该估算未含 attention 的上下文相关运算、激活、量化与通信，不是完整模型 FLOP 精确值。</p><p>理想可重叠时下界接近 <code>max(Tcompute,Tmemory,Tcommunication)</code>；实际依赖链和重叠不足会增加时间，不能无条件把各项相加，也不能无条件只取最大。FlashAttention 主要减少 attention 中间流量，不能免掉模型权重或 decode 所需 KV 的全部读取。<a href=\"https://arxiv.org/pdf/2205.14135\" target=\"_blank\" rel=\"noopener\">FlashAttention</a> <a href=\"https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.pdf\" target=\"_blank\" rel=\"noopener\">Roofline</a></p>"
+        },
+        {
+          "id": "case-options",
+          "title": "5. 比较三种方案：每个结论带一个成立条件",
+          "html": "<p><strong>以下堆栈配置纯为教学假设，单堆栈原始带宽均设为 1.6 TB/s，效率均先设 75%。</strong></p><table><thead><tr><th>方案</th><th>总容量</th><th>有效带宽</th><th>本题数据搬运下界</th><th>判断</th></tr></thead><tbody><tr><td>A：4×48 GB，BF16 权重</td><td>192 GB</td><td>4.8 TB/s</td><td>161.47/4800≈33.64 ms</td><td>仅搬运已超目标，没有实现余量</td></tr><tr><td>B：6×32 GB，BF16 权重</td><td>192 GB</td><td>7.2 TB/s</td><td>约 22.43 ms</td><td>容量相同，接口并行更多；需付封装/PHY/功耗代价</td></tr><tr><td>C：4×48 GB，理想 INT8 权重</td><td>192 GB</td><td>4.8 TB/s</td><td>(70+21.47)/4800≈19.06 ms</td><td>可能减流量；质量、元数据与量化 kernel 需验证</td></tr></tbody></table><p>不能只选最短理论时间。B 需要更多物理资源；C 需要软件和模型条件成立。若用 HBF 增容量却替换部分 HBM，还应重算剩余热层带宽；若全部权重无法常驻热层，则搬运过程加入关键路径，容量增加也可能导致延迟下降不了。</p><p>设计取舍应以“满足约束的最小成本方案”为目标，比较基线、改动、收益、代价、失效场景，而不是让某一个指标最大。</p>"
+        },
+        {
+          "id": "case-power-area",
+          "title": "6. 功耗、面积、可靠性：不知道的量要列成待验证项",
+          "html": "<p><strong>教学能量假设：</strong>若接口动态能耗为 2 pJ/bit，方案 B 按有效数据 7.2 TB/s 折算为 115.2 W；按 9.6 TB/s 满速传输折算为 153.6 W。实际能量口径须包含无用传输与编码等，并另计阵列、refresh、静态、控制器和封装。这里不能推导真实某代 HBM 功耗。</p><p>面积至少分成 DRAM die、加速器上的控制器/PHY、封装占用；它们不是同一个 mm²。没有版图、工艺或经过校准的模型时，正确做法是列出资源需求和模型输入，不编造面积结果。</p><p>验收还要包含温度下的速率/刷新变化、错误上报、ECC 覆盖、坏资源降级、数据完整性与长期可靠性。容量“装得下”、短时“跑得快”只是两项条件。</p>"
+        },
+        {
+          "id": "case-review",
+          "title": "7. 一页面试交付：让方案可以被否证",
+          "html": "<ol><li><strong>需求表：</strong>模型/数值格式、batch/上下文分布、p99 TTFT/ITL、总吞吐、功耗及成本上限。</li><li><strong>数据表：</strong>权重、KV、临时状态、元数据分别计容量、读写量、复用、寿命。</li><li><strong>架构表：</strong>存储类型、堆栈/通道、数据放置、映射、调度、缓冲与错误处理。</li><li><strong>模型：</strong>容量预算、带宽下界、计算下界、重叠假设、敏感性区间。</li><li><strong>实验：</strong>microbenchmark 校准带宽与延迟，再跑真实长度分布、混合 prefill/decode、长尾和高温场景。</li><li><strong>决策：</strong>说明何种证据支持 B 或 C，什么结果会推翻它；保留回退配置。</li></ol><p>可复述回答：“我先明确 batch 与上下文，再得到 177.47 GB 教学容量预算和约 4.84 TB/s 有效带宽下限。四堆栈基线在假设效率下没有时延余量，所以我比较更多并行接口与权重量化，并把质量、封装功耗及 p99 验证作为决策条件。”这是纸面分析示例，未运行实验时不要称为已经实现的产品。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "70B BF16 模型为什么不等于只需要 140 GB 内存？",
+          "answer": "140 GB 只是按 70×10⁹ 参数、2 B/参数计算的纯权重。还要加 KV cache、workspace、框架与元数据、碎片、通信和服务余量。KV 还随 batch、上下文、KV head 数和数值格式变化，应单独逐因子计算。",
+          "followups": [
+            "GB 与 GiB 差多少？",
+            "GQA 为什么改变 KV 预算？"
+          ]
+        },
+        {
+          "q": "batch 从 1 提到 8，吞吐是否一定提高 8 倍？",
+          "answer": "不会自动线性提高。权重可在 batch 内复用，但 KV 流量和计算增加，容量可能限制批量；调度等待、padding、kernel 效率和 p99 也会变化。应比较每 step 时间和每秒输出 token，而不是只看 batch 数。",
+          "followups": [
+            "哪一项流量可摊薄，哪一项难以摊薄？",
+            "在线 SLA 下如何选择 batch？"
+          ]
+        },
+        {
+          "q": "方案 B 理论搬运 22.43 ms，能否承诺 30 token/s？",
+          "answer": "不能。这只是简化流量与固定效率下的下界；尚未完整计计算、额外流量、通信、调度以及尾延迟。它说明有继续验证的空间，应通过实际流量和端到端时序校准，而不是把下界当测量值。",
+          "followups": [
+            "理想重叠时为何取 max？",
+            "哪些串行环节会破坏重叠？"
+          ]
+        },
+        {
+          "q": "客户说“加 HBF 就能解决容量墙”，你怎么推进？",
+          "answer": "先问哪些数据放到 HBF、是否保留足够 HBM 热层、迁移粒度与预取可预测性、写入与寿命要求。然后把容量收益和新增关键路径 I/O 同时建模，以 p99 goodput、能耗和成本评估，而不是只验证模型能装入。",
+          "followups": [
+            "替换一个 HBM stack 会损失什么？",
+            "什么工作负载最不适合依赖预取？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "本题每请求每 token 的 KV 大小为何是 320 KiB？",
+          "options": [
+            "70B×2 B",
+            "2×80×8×128×2 B",
+            "8×8192 B"
+          ],
+          "correct": 1,
+          "explanation": "逐项是 K/V 两份、层数、KV head、head dimension 和每元素字节数；batch/context 尚未乘入。"
+        },
+        {
+          "q": "若模型权重不变，上下文翻倍，哪项一阶变化正确？",
+          "options": [
+            "权重与 KV 都翻倍",
+            "权重不变，KV 容量近似翻倍",
+            "只有权重翻倍"
+          ],
+          "correct": 1,
+          "explanation": "普通 dense MHA/GQA 的 KV 元素数随序列长度增长，权重是模型常驻参数。"
+        },
+        {
+          "q": "本题每 step 为 batch=8 各生成一 token，step=40 ms，总吞吐是多少？",
+          "options": [
+            "25 token/s",
+            "200 token/s",
+            "320 token/s"
+          ],
+          "correct": 1,
+          "explanation": "8/0.04=200 token/s，总吞吐；每用户则为 25 token/s。"
+        }
+      ],
+      "sourceIds": [
+        "sys09",
+        "sys10",
+        "sys11",
+        "sys15",
+        "sys16",
+        "sys18"
+      ]
+    },
+    {
+      "id": "interview-lab",
+      "title": "面试实验室：三个能诚实复现、能讲设计取舍的小项目",
+      "group": "system",
+      "level": "advanced",
+      "minutes": 90,
+      "intro": "这里提供的是可执行的实验设计与复现路线，不是已经完成的实验结果。你可以先把它作为论文阅读和方案分析讲清楚，再实际运行、记录和复核，逐步升级为可展示项目。面试最有分量的是可追溯证据和失败解释。",
+      "prerequisites": [
+        "controller",
+        "gpu-memory",
+        "architecture-case"
+      ],
+      "outcomes": [
+        "设计有对照、可复现的 DRAM 调度实验",
+        "用 GPU 微基准分离合并访问、缓存、MLP 影响",
+        "建立 HBM/HBF 参数化模型并解释其有效边界"
+      ],
+      "sections": [
+        {
+          "id": "lab-evidence",
+          "title": "1. 项目表述分三档：读过、复现过、改进过",
+          "html": "<p><strong>阅读分析：</strong>“我读了原论文，复核了容量/带宽推导，设计了待运行的对照实验。”<strong>完成复现：</strong>“我在指定 commit、配置与机器上跑了基线，保留了输入、日志和结果。”<strong>验证改进：</strong>“我修改某机制，在固定条件下得到差异，并分析统计波动、开销和失效场景。”没有做到哪一档，就不提前使用那一档的动词。</p><p>每个项目建立相同证据包：README、环境/版本、固定随机种子、输入生成脚本、配置、原始日志、汇总 CSV、作图脚本、已知限制。图上写清单位、误差与样本。论文的收益数字只能标“论文报告”，不得替代自己的测量。</p><p>建议先完成项目一的单 bank/双 bank 诊断，再做项目二；项目三适合把你现有架构能力与 HBF 前沿连接起来。三者追求“能解释一张图”，而不是堆很多未经校准的曲线。</p>"
+        },
+        {
+          "id": "lab-ramulator-setup",
+          "title": "2. 项目一：用 Ramulator 研究“吞吐优先”何时伤害延迟",
+          "html": "<p><strong>问题：</strong>FR-FCFS、朴素按年龄选择、带年龄保护的策略，在相同 DRAM 与流量下如何改变吞吐和公平性？以 Ramulator 2.0 论文理解模块化设计；本次查到的官方仓库已是 2.1。下面固定的是本轮核验的 2.1 提交，属于复现起点，尚未在此材料中编译或跑通。</p><pre>git clone https://github.com/CMU-SAFARI/ramulator2.git\ncd ramulator2\ngit checkout c6c7a5de0cef35935d6fad7369e6271406798865\ngit rev-parse HEAD</pre><p>在 Linux/WSL 或仓库支持的开发容器中，按固定版本 README 安装 C++20、CMake、Python 依赖，先运行官方 example 与对应时序/调度测试。入口是 <code>examples/example_config.py</code>；测试包括 <code>tests/device_timings</code> 和 <code>tests/controller_scheduling</code>。不要把旧 2.0 YAML 教程与新 2.1 Python API 混用。<a href=\"https://github.com/CMU-SAFARI/ramulator2/tree/c6c7a5de0cef35935d6fad7369e6271406798865\" target=\"_blank\" rel=\"noopener\">固定提交与 README</a> <a href=\"https://arxiv.org/pdf/2308.11030\" target=\"_blank\" rel=\"noopener\">2.0 论文</a></p><p><strong>输入：</strong>固定一个 DDR4 preset 作为教学基线，保持组织、速率、映射、队列和刷新不变。先构造已知地址向量，验证同一打开行、同 bank 不同行、不同 bank 三类序列；再生成连续流、均匀随机、bank 热点以及“行命中流＋延迟敏感流”。随机种子设 1、2、3；每组预热与正式请求数明确记录。</p>"
+        },
+        {
+          "id": "lab-ramulator-method",
+          "title": "3. 项目一如何形成可信结果",
+          "html": "<p><strong>变量：</strong>先只换调度器；再单独扫描注入间隔、读写比、队列深度和年龄阈值。不存在的策略要明确自己实现，并保持同地址依赖与命令合法性。不要同时改映射、频率和调度，然后把收益都归给调度。</p><p><strong>输出：</strong>完成字节/模拟时间、平均/p95/p99 请求延迟、每来源服务量与等待上界、row hit/conflict、ACT/PRE 次数、队列占用。若需要 p99 或来源统计而默认计数器没有，就记录请求到达/完成时间及 source ID。只统计已完成请求时，还应报告未完成/被截断请求，避免把最慢请求排除。</p><p><strong>关键对照：</strong>低负载与接近饱和分别画 latency-throughput 曲线；双流与各流单独运行比较。请求流必须反映注入和反压，固定 trace 的离线重放不能自动代表应用 IPC；需要系统收益时再接有依赖/计算间隔的 frontend。<a href=\"https://groups.csail.mit.edu/cag/PSRG/papers/rixner_isca27.pdf\" target=\"_blank\" rel=\"noopener\">重排基础</a> <a href=\"https://people.inf.ethz.ch/omutlu/pub/bliss-memory-scheduler_iccd14.pdf\" target=\"_blank\" rel=\"noopener\">公平性案例</a></p><p><strong>失败解释：</strong>策略几乎无差异，可能是负载太轻、全是行命中或总线已饱和；行命中提升但吞吐下降，可能是 bank 并行被牺牲；平均延迟改善但 p99 变差，可能有偏置/饥饿。先检查地址与命令 trace，再谈架构结论。</p>"
+        },
+        {
+          "id": "lab-gpu",
+          "title": "4. 项目二：GPU 访存微基准，把“快慢”拆成可测因素",
+          "html": "<p><strong>问题：</strong>保持有效读取工作量时，stride、偏移、工作集、并发如何影响有效字节/s 和实际事务？使用自己有权限的 CUDA GPU，记录 GPU 型号、驱动、CUDA、编译选项、频率/功耗状态和 profiler 版本；没有 GPU 时先做代码与预测，不报硬件结果。</p><pre>// 示意核心；输入至少覆盖 (n-1)*stride+offset+1 个元素\n__global__ void gather(const float* in, float* out,\n                       size_t n, size_t stride, size_t offset) {\n    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;\n    if (i &lt; n) out[i] = in[i * stride + offset];\n}</pre><p><strong>输入和对照：</strong>stride=1/2/4/8/16/32，offset=0/1/2/4 个 float；另做小于与显著大于 L2 的工作集扫描。固定有效读取数时 stride 会改变总覆盖空间，要另设固定覆盖空间的对照并说明两种口径。比较连续流与单依赖链/多独立链，分离带宽与 MLP。数组先初始化，保留输出并检查正确性，避免编译器删去工作。</p><p><strong>测量：</strong>预热后用 CUDA event 计 kernel 区间，重复多次报告中位数和分位数，单独记录主机计时；copy kernel 的有效读写字节按实际操作计算。收集 DRAM bytes、L2 命中/流量、sector/request、stall 等可用指标，再按当前 GPU 文档解释。冷/热缓存实验分开；Nsight replay 默认清缓存，不能与自然热缓存运行混为一谈。<a href=\"https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html\" target=\"_blank\" rel=\"noopener\">CUDA 合并访问</a> <a href=\"https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html\" target=\"_blank\" rel=\"noopener\">Nsight 测量条件</a></p><p><strong>失败解释：</strong>带宽“超过 HBM 峰值”先查是否命中 L2、字节分母是否重复计数；stride 没明显影响先查缓存复用或其它瓶颈；小 kernel 波动大先查启动/计时与动态频率。不能仅凭 stride 曲线反推出未公开的完整 bank 映射。</p>"
+        },
+        {
+          "id": "lab-hbf",
+          "title": "5. 项目三：HBM/HBF 两层预取模型，检验容量是否能转成吞吐",
+          "html": "<p><strong>问题：</strong>在固定封装资源/成本情景下，保留多少 HBM 热层、将什么放到 HBF，才能满足 SLA？这是自行编写的 Python 离散事件或时间线模型，不是 HBF 实物测量，也不是标准认证模拟器。灵感来自分层放置与传输重叠；FlexGen 的对象是 GPU/CPU/磁盘，并未验证 HBF。<a href=\"https://arxiv.org/pdf/2303.06865\" target=\"_blank\" rel=\"noopener\">FlexGen，§4</a></p><p><strong>输入：</strong>按层的权重/KV块大小、访问次序、计算时间；HBM/HBF 容量、读写带宽、首数据延迟、并发服务额度、缓冲大小、预取距离、命中率和链路竞争。分别设全 HBM、仅按需迁移、固定距离预取、知道未来的理想预取四条基线。理想预取只作为上界。</p><p><strong>教学假设：</strong>HBF 首数据延迟 20 μs、链路上限 1 TB/s。4 MiB 单块的串行完成约 20+4.19=24.19 μs，对应约 173 GB/s；4 KiB 单块串行只有约 0.205 GB/s。都远低于 1 TB/s，说明需要粒度和并行。按带宽—延迟积，仅覆盖 20 μs 延迟就需约 20 MB 在途，即至少约 5 个 4 MiB 请求；内部资源限制还可能需要更多或无法达到。</p><pre>对每个访问块：\n  若已驻留 HBM：排队等待 HBM 读服务，计入共享带宽与首数据延迟\n  否则：排队等 HBF 服务、链路、缓冲及 HBM 填充；记录数据可用时间\n  消费开始 = max(依赖完成, 数据已到达计算侧可消费的位置)\n  预取下一批可预测块；按容量执行驱逐\n  记录 stall、搬运字节、无用预取与写入量</pre><p>HBM 命中只表示不必从冷层取回，不代表数据能零成本到达计算单元。权重读、KV 读写与冷层填充若共享 HBM 端口，要在同一资源队列计费；可重叠的是独立资源上的操作。如果 Tcompute 已包含经校准的 HBM 服务，则应写清统计边界并避免重复计数。</p><p><strong>输出：</strong>每 step 时间、p99、满足 SLA 的 goodput、HBM 占用、迁移放大、预取准确率/覆盖率、HBF 读写量及能耗模型范围。扫顺序读取、随机专家选择、长尾上下文和混合写入。预取失败应能归因于地址不可知、队列拥塞、热层太小、带宽不足或无用搬运，而不是一律再加缓冲。</p>"
+        },
+        {
+          "id": "lab-analysis",
+          "title": "6. 每张图配一段“为什么”，不能只说提高了多少",
+          "html": "<p>统一回答模板：<strong>目标与约束 → 机制假设 → 对照与指标 → 结果/目前状态 → 代价 → 失效条件 → 下一步证据。</strong>没有跑结果时，把“结果”明确替换为“预计可区分的现象”，例如：“若 bank 并行是瓶颈，分散地址应减少服务等待；若总线已饱和，收益应变小。我准备通过命令占用和完成吞吐验证。”</p><p>可复述的阅读版自我介绍：“我原有 GPU/SoC 架构基础，近期重点补齐了 DRAM 的 row-buffer 与时序约束。我围绕控制器公平性、GPU 事务效率和 HBM/HBF 数据放置设计了三组对照，当前完成了文献和一阶模型；尚未完成的硬件实验我不会报收益。下一步优先校准实际访问流量和 latency-throughput 曲线。”完成实验后，再替换成自己的具体配置和可追溯结论。</p><p>论文阅读顺序：Rixner 建立重排直觉；BLISS 学公平性；Ramulator 学怎么建模；Roofline 学怎么给上界；FlashAttention/PagedAttention 学不同层级的流量与容量优化；FlexGen 学分层放置的吞吐—延迟代价。</p>"
+        },
+        {
+          "id": "lab-mock",
+          "title": "7. 一轮 20 分钟模拟面试",
+          "html": "<ol><li><strong>3 分钟：</strong>画一次 GPU load 到 DRAM 的路径，指出 coalescing、L2 hit、row hit 分别在哪。</li><li><strong>4 分钟：</strong>给定行命中流和随机流，设计控制器 QoS；说清什么状态要加、何时会不如基线。</li><li><strong>5 分钟：</strong>口算 70B 权重和 KV，区分总吞吐、用户 token/s、prefill 与 decode。</li><li><strong>4 分钟：</strong>给一个 HBF 高带宽声明，说明还缺哪些数据才能判断是否适合这个模型。</li><li><strong>4 分钟：</strong>面试官改变 batch、上下文或功耗约束，你现场更新判断，并提出最小验证实验。</li></ol><p>优秀回答的标志不是名词最多，而是每个结论都能回答“因为什么、在什么条件下、怎么测”。遇到不知道的内部细节，可以明确公开资料边界，再说明可观测量与验证方法；这通常比编造具体 bank 位或芯片时序更专业。</p>"
+        }
+      ],
+      "interview": [
+        {
+          "q": "你的研究是不是只读论文，没有真实项目？",
+          "answer": "按实际完成度回答。若目前只读和建模，就明确这是专项调研与实验设计，展示推导、对照和版本记录；如果已跑通，再展示原始日志与复现方法。阅读研究本身可以证明分析能力，但不能替代 RTL、硅后或硬件测量经历。",
+          "followups": [
+            "你亲手完成了哪一部分？",
+            "哪个结果与你的预期相反？"
+          ]
+        },
+        {
+          "q": "你的新调度器平均吞吐提高 10%，是否就该采用？",
+          "answer": "先确认 10% 是自己的实测还是题设，然后看实验可比性、每流 slowdown、p99、饥饿与实现时序/面积成本。还要测低负载和未见工作负载，确认不是牺牲少数任务或改变了其它条件。",
+          "followups": [
+            "如何检查统计和截断偏差？",
+            "若收益只来自一个负载怎么办？"
+          ]
+        },
+        {
+          "q": "HBF 模型预测很好，怎样避免模型只是证明自己的假设？",
+          "answer": "把结果拆成可校准的首数据延迟、粒度、并发、链路和计算重叠；同时跑按需与理想上界，给敏感性范围和不利工作负载。未知的器件参数标为假设，之后用公开测量或硬件数据校准。若只有理想预测有效，就不能宣称产品可行。",
+          "followups": [
+            "固定封装面积下会减少多少 HBM？",
+            "随机访问和写入如何建模？"
+          ]
+        },
+        {
+          "q": "微基准带宽异常高，你先做什么？",
+          "answer": "先检查字节口径、计时区间、异步完成、编译器消除和数据正确性，再检查缓存命中与工作集。固定 profiler 的缓存/replay 设置，保留自然运行结果作对照。只有定位流量走到哪一级，带宽数字才有意义。",
+          "followups": [
+            "CUDA event 与主机计时分别包含什么？",
+            "怎样避免用 cache 测量冒充 DRAM 带宽？"
+          ]
+        }
+      ],
+      "quiz": [
+        {
+          "q": "未运行的 HBF 参数模型在面试中最准确的名称是？",
+          "options": [
+            "已量产验证的 HBF 架构",
+            "已取得硬件加速收益的项目",
+            "待校准的架构分析与拟议实验"
+          ],
+          "correct": 2,
+          "explanation": "将设计、模拟、硬件验证与产品化区分开，结论才可信。"
+        },
+        {
+          "q": "比较两种调度器时，哪种实验最有说服力？",
+          "options": [
+            "同时改变频率、映射和调度器",
+            "固定其它参数，扫描负载并报告每流和尾延迟",
+            "只挑最好的一条 trace"
+          ],
+          "correct": 1,
+          "explanation": "需要单变量对照、负载覆盖和多指标，才可解释因果及适用范围。"
+        },
+        {
+          "q": "20 μs 首数据延迟的 4 KiB 串行读取，能否仅凭 1 TB/s 峰值达到 1 TB/s？",
+          "options": [
+            "可以，峰值就是任何请求的速率",
+            "不可以；首数据与并发限制会主导",
+            "把时钟乘 2 就一定可以"
+          ],
+          "correct": 1,
+          "explanation": "单请求约 20 μs 才完成，4 KiB/20 μs 约 0.205 GB/s；需要并行与粒度才能接近聚合带宽。"
+        }
+      ],
+      "sourceIds": [
+        "sys01",
+        "sys03",
+        "sys05",
+        "sys06",
+        "sys07",
+        "sys09",
+        "sys10",
+        "sys11",
+        "sys16",
+        "sys17",
+        "sys18"
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "id": "sys01",
+      "title": "Memory Access Scheduling",
+      "url": "https://groups.csail.mit.edu/cag/PSRG/papers/rixner_isca27.pdf",
+      "type": "paper",
+      "year": 2000,
+      "venue": "ISCA 2000",
+      "evidence": "已核读第 3 节设计空间与第 5 节 first-ready/aggressive reordering。支持按 DRAM bank/row/column 状态重排请求；历史评测数字不能直接外推到 DDR5/HBM。"
+    },
+    {
+      "id": "sys02",
+      "title": "DFI：控制器与 PHY 接口官方说明",
+      "url": "https://ddr-phy.org/",
+      "type": "official",
+      "year": 2026,
+      "venue": "DFI Group；2026-10-30 访问",
+      "evidence": "官方明确 DFI 的接口边界；页面记录 DFI 6.0 于 2026-05 发布并首次正式加入 HBM 支持。训练分工仍应查所用版本及 IP。"
+    },
+    {
+      "id": "sys03",
+      "title": "The Blacklisting Memory Scheduler: Achieving High Performance and Fairness at Low Cost",
+      "url": "https://people.inf.ethz.ch/omutlu/pub/bliss-memory-scheduler_iccd14.pdf",
+      "type": "paper",
+      "year": 2014,
+      "venue": "ICCD 2014",
+      "evidence": "已核读第 III–V 节：连续服务计数、黑名单分类、周期清除，以及非黑名单/行命中/年龄优先级。用于学习公平性与硬件成本，不引用其阈值为通用最佳值。"
+    },
+    {
+      "id": "sys04",
+      "title": "Improving DRAM Performance by Parallelizing Refreshes with Accesses",
+      "url": "https://people.inf.ethz.ch/omutlu/pub/dram-access-refresh-parallelization_hpca14.pdf",
+      "type": "paper",
+      "year": 2014,
+      "venue": "HPCA 2014",
+      "evidence": "已核读机制：DARP 调整 per-bank 刷新次序并与写回批次重叠；SARP 需 DRAM 内部支持子阵列访问与刷新并行。论文中的当代标准背景是 2014 年。"
+    },
+    {
+      "id": "sys05",
+      "title": "Ramulator 2.0: A Modern, Modular, and Extensible DRAM Simulator",
+      "url": "https://arxiv.org/pdf/2308.11030",
+      "type": "paper",
+      "year": 2023,
+      "venue": "2023 arXiv 版本；IEEE Computer Architecture Letters",
+      "evidence": "已核读第 2 节：将控制器与 DRAM 标准解耦、接口/实现模块化、命令与时序约束。2023 是预印本年份；当前仓库引用条目列 CAL 2024。"
+    },
+    {
+      "id": "sys06",
+      "title": "CMU-SAFARI/ramulator2 官方仓库",
+      "url": "https://github.com/CMU-SAFARI/ramulator2",
+      "type": "official",
+      "year": 2026,
+      "venue": "CMU SAFARI；2026-10-30 访问",
+      "evidence": "已核读 README 的配置、统计及测试章节。当前默认文档为 Ramulator 2.1，不能把它的 Python 配置命令照搬到 2.0；实验须固定提交。 本轮 git ls-remote 与固定 README 核验提交为 c6c7a5de0cef35935d6fad7369e6271406798865。"
+    },
+    {
+      "id": "sys07",
+      "title": "CUDA Programming Guide：Writing SIMT Kernels",
+      "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html",
+      "type": "official",
+      "year": 2026,
+      "venue": "NVIDIA 持续更新官方文档；2026-10-30 访问",
+      "evidence": "已核读 Coalesced Global Memory Access：warp 请求合并为 32-byte 事务，强调使用字节/传输字节比例。事务口径不能直接当作 DRAM burst。"
+    },
+    {
+      "id": "sys08",
+      "title": "NVIDIA Hopper Architecture In-Depth",
+      "url": "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/",
+      "type": "official",
+      "year": 2022,
+      "venue": "NVIDIA 官方架构说明",
+      "evidence": "已核读 GH100/H100 配置与架构图、L2/HBM 控制器、TMA 说明。区分完整 die 与 SKU，不将其中早期性能规格当最新产品承诺。"
+    },
+    {
+      "id": "sys09",
+      "title": "Roofline: An Insightful Visual Performance Model for Floating-Point Programs and Multicore Architectures",
+      "url": "https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.pdf",
+      "type": "paper",
+      "year": 2008,
+      "venue": "UC Berkeley 技术报告 UCB/EECS-2008-134；2009 CACM 工作的原始报告",
+      "evidence": "已核读第 2 节和讨论：以选定层级实际流量定义 operational intensity，性能上界为计算峰值和带宽乘强度的较小者；可为 L2 等层级建立 roofline。"
+    },
+    {
+      "id": "sys10",
+      "title": "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness",
+      "url": "https://arxiv.org/pdf/2205.14135",
+      "type": "paper",
+      "year": 2022,
+      "venue": "NeurIPS 2022",
+      "evidence": "已核读第 3 节：分块、在线 softmax 统计、反向重算、融合减少 HBM 中间流量。exact 表示标准注意力计算，不意味着所有浮点执行逐位一致。"
+    },
+    {
+      "id": "sys11",
+      "title": "Efficient Memory Management for Large Language Model Serving with PagedAttention",
+      "url": "https://arxiv.org/html/2309.06180v1",
+      "type": "paper",
+      "year": 2023,
+      "venue": "SOSP 2023",
+      "evidence": "已核读第 3、4、7 节：KV 分块映射、动态分配、共享；块尺寸在内存碎片和执行效率间取舍。其软件 block 不是 DRAM row。"
+    },
+    {
+      "id": "sys12",
+      "title": "Choosing the Right DDR SDRAM Memory for Your Application",
+      "url": "https://www.synopsys.com/dw/doc.php/wp/which_DDR_SDRAM_memory_to_use_and_when_LI.pdf",
+      "type": "official",
+      "year": 2019,
+      "venue": "Synopsys 官方白皮书（历史分类资料）",
+      "evidence": "已核读 DDR/LPDDR/GDDR/HBM 分类和应用取舍。只用于稳定分类与 PPA 思路，文中 DDR5 仍属未来的表述已过时，不沿用其路线图。"
+    },
+    {
+      "id": "sys13",
+      "title": "Micron LPDDR5X 官方产品与应用说明",
+      "url": "https://www.micron.com/products/memory/lpddr-components/lpddr5x",
+      "type": "official",
+      "year": 2026,
+      "venue": "Micron 持续更新页面；2026-10-30 访问",
+      "evidence": "已核读 mobile、data center 应用及标准说明。证明 LPDDR 应用不限手机；厂商功耗优势必须限定测试口径。"
+    },
+    {
+      "id": "sys14",
+      "title": "NAND Flash Organization",
+      "url": "https://onlinedocs.microchip.com/oxy/GUID-87101AE8-6003-4D1F-B624-895C158CCD3E-en-US-1/GUID-F3BE160C-4AEC-4F0A-92A7-39025FDDEE0B.html",
+      "type": "official",
+      "year": 2024,
+      "venue": "Microchip 官方在线技术文档",
+      "evidence": "已核读 NAND block/page/spare 区、坏块管理与有限寿命说明。未套用该页旧器件寿命数值到 HBF 或现代 TLC/QLC。"
+    },
+    {
+      "id": "sys15",
+      "title": "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints",
+      "url": "https://aclanthology.org/2023.emnlp-main.298.pdf",
+      "type": "paper",
+      "year": 2023,
+      "venue": "EMNLP 2023",
+      "evidence": "已核读第 2 节：多个 query head 分组共享 K/V head。KV 容量公式应使用 KV head 数，不能不加区分地代入 query head 数。"
+    },
+    {
+      "id": "sys16",
+      "title": "FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU",
+      "url": "https://arxiv.org/pdf/2303.06865",
+      "type": "paper",
+      "year": 2023,
+      "venue": "ICML 2023",
+      "evidence": "已核读第 4 节：分层放置、批次/层遍历、传输与计算重叠。目标是延迟不敏感的吞吐量，不能将离线收益等同聊天 p99 延迟改善，也不是 HBF 实测。"
+    },
+    {
+      "id": "sys17",
+      "title": "Nsight Compute Profiling Guide",
+      "url": "https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html",
+      "type": "official",
+      "year": 2026,
+      "venue": "NVIDIA 持续更新官方文档；2026-10-30 访问",
+      "evidence": "已核读采集模式、Cache Control、指标说明。默认 replay 之间清缓存可改变实验语义；应记录 replay/cache-control 配置。"
+    },
+    {
+      "id": "sys18",
+      "title": "Sandisk HBF Fact Sheet",
+      "url": "https://documents.sandisk.com/content/dam/asset-library/en_us/assets/public/sandisk/collateral/company/Sandisk-HBF-Fact-Sheet.pdf",
+      "type": "official",
+      "year": 2025,
+      "venue": "Sandisk 2025-07 技术简介",
+      "evidence": "已核读三页简介：HBF 基于 NAND、面向 AI 推理。容量/带宽/性能表述属于厂商设计说明，不作为本学习项目实测；最新进展见独立 HBF 模块。"
+    }
+  ],
+  "papers": [
+    {
+      "id": "sys-paper-rixner",
+      "title": "Memory Access Scheduling",
+      "year": 2000,
+      "venue": "ISCA",
+      "url": "https://groups.csail.mit.edu/cag/PSRG/papers/rixner_isca27.pdf",
+      "sourceId": "sys01",
+      "modules": [
+        "controller",
+        "interview-lab"
+      ],
+      "problem": "同一 DRAM 的有效带宽随 bank/row/column 访问模式变化，简单按序服务会浪费可并行机会。",
+      "mechanism": "观察未完成请求，按命令就绪、行状态与年龄重排访问；论文区分 first-ready 和更积极的列/行优先策略。",
+      "tradeoff": "局部性与并行可能改善，但请求等待、顺序语义、控制逻辑和公平性需要另行处理。",
+      "evidence": "阅读重点为 §3 调度设计空间、§5 不同调度比较。论文使用当时媒体负载，不把其百分比当现代 GPU 预测。",
+      "interview": "先给出“同 bank 换行”和“另一 bank 已就绪”的小例子，再解释重排为什么能填补空闲。"
+    },
+    {
+      "id": "sys-paper-bliss",
+      "title": "The Blacklisting Memory Scheduler",
+      "year": 2014,
+      "venue": "ICCD",
+      "url": "https://people.inf.ethz.ch/omutlu/pub/bliss-memory-scheduler_iccd14.pdf",
+      "sourceId": "sys03",
+      "modules": [
+        "controller",
+        "interview-lab"
+      ],
+      "problem": "行命中和高强度流可能持续占用共享内存，让其它应用被不公平地拖慢。",
+      "mechanism": "以连续服务计数把来源暂分为两组，优先非黑名单请求，再看行命中和年龄，周期清除分类。",
+      "tradeoff": "用较小状态换取公平性，但阈值、恢复周期和来源粒度需要适配工作负载。",
+      "evidence": "核读 §III–V，包括优先级和硬件存储项。论文包含性能、公平性和实现复杂度比较；这里不复用其阈值为最佳值。",
+      "interview": "回答“行命中最高是不是最好”时，主动补每来源 slowdown、p99 与硬件仲裁开销。"
+    },
+    {
+      "id": "sys-paper-darp",
+      "title": "Improving DRAM Performance by Parallelizing Refreshes with Accesses",
+      "year": 2014,
+      "venue": "HPCA",
+      "url": "https://people.inf.ethz.ch/omutlu/pub/dram-access-refresh-parallelization_hpca14.pdf",
+      "sourceId": "sys04",
+      "modules": [
+        "controller"
+      ],
+      "problem": "刷新会占用 bank/rank，固定刷新次序可能与业务访问冲突。",
+      "mechanism": "DARP 寻找空闲 bank 与写回时段；SARP 借助子阵列级内部支持，使刷新和访问进一步重叠。",
+      "tradeoff": "调度灵活性受保持/刷新规则约束，子阵列并行涉及 DRAM 内部改动和共享资源限制。",
+      "evidence": "核读 DARP/SARP 机制与论文对标准背景的说明；其 2014 年器件背景不能代替今天标准原文。",
+      "interview": "将提案拆成控制器可改变部分和需要 DRAM 电路/协议支持部分，明确验证不漏刷新。"
+    },
+    {
+      "id": "sys-paper-ramulator",
+      "title": "Ramulator 2.0: A Modern, Modular, and Extensible DRAM Simulator",
+      "year": 2023,
+      "venue": "arXiv 2023；IEEE CAL",
+      "url": "https://arxiv.org/pdf/2308.11030",
+      "sourceId": "sys05",
+      "modules": [
+        "controller",
+        "interview-lab"
+      ],
+      "problem": "控制器与设备模型耦合会让新机制评估难以修改、比较和验证。",
+      "mechanism": "以共享接口和独立实现组织控制器、DRAM 规则等模块，便于更换策略和建模新命令。",
+      "tradeoff": "周期级模拟保留命令时序细节，但真实性仍受工作负载、参数与建模边界限制，不等于电路或实物验证。",
+      "evidence": "核读 §2；2023 预印本与当前 2.1 仓库需要分版本。本材料给了核验过的 2.1 提交作为新实验起点。",
+      "interview": "说明你修改了哪个模块、保持哪些参数不变，并用短 trace 与命令合法性检查证明模型没被改坏。"
+    },
+    {
+      "id": "sys-paper-roofline",
+      "title": "Roofline: An Insightful Visual Performance Model",
+      "year": 2008,
+      "venue": "UC Berkeley 原始技术报告；后续 CACM 2009",
+      "url": "https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.pdf",
+      "sourceId": "sys09",
+      "modules": [
+        "gpu-memory",
+        "architecture-case",
+        "interview-lab"
+      ],
+      "problem": "只看 FLOPS 或时钟无法判断程序为什么慢，也难以决定优化计算还是数据搬运。",
+      "mechanism": "选定层级，用 FLOP/byte 与持续带宽构造斜线，用对应计算峰值构造水平上限。",
+      "tradeoff": "模型易解释但属于上界；实际依赖、并发、调度和多层缓存需要进一步分析。",
+      "evidence": "核读 operational intensity 定义、公式及 L2 roofline 讨论。应对齐运算精度、数据口径和带宽层级。",
+      "interview": "先写 min(P,B×I)，再说明观测点为何可能远在屋顶下方，以及要补哪组计数器。"
+    },
+    {
+      "id": "sys-paper-flash",
+      "title": "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness",
+      "year": 2022,
+      "venue": "NeurIPS",
+      "url": "https://arxiv.org/pdf/2205.14135",
+      "sourceId": "sys10",
+      "modules": [
+        "gpu-memory",
+        "architecture-case",
+        "interview-lab"
+      ],
+      "problem": "注意力中间矩阵在 HBM 与片上存储之间反复搬运，FLOP 少不一定执行快。",
+      "mechanism": "分块、在线 softmax 统计、融合和反向重算，避免完整中间矩阵的外存物化。",
+      "tradeoff": "片上容量、tile、寄存器和并发互相约束；保持标准 attention 不代表消除全部 KV 或线性化算术复杂度。",
+      "evidence": "核读 §3，特别是 tiling/recomputation。论文测量来自特定模型/硬件，不以最高加速比代替用户实验。",
+      "interview": "用“多做部分计算，少搬大量字节”解释取舍，再区分 SRAM/HBM 之间的 I/O 与 DRAM 芯片内部时序。"
+    },
+    {
+      "id": "sys-paper-paged",
+      "title": "Efficient Memory Management for Large Language Model Serving with PagedAttention",
+      "year": 2023,
+      "venue": "SOSP",
+      "url": "https://arxiv.org/html/2309.06180v1",
+      "sourceId": "sys11",
+      "modules": [
+        "gpu-memory",
+        "architecture-case",
+        "interview-lab"
+      ],
+      "problem": "KV 随序列增长，连续预留和碎片浪费容量，限制可服务并发。",
+      "mechanism": "逻辑 KV 块映射到不连续物理块，按需分配，并支持块共享等机制。",
+      "tradeoff": "块小降低碎片但可能增加管理/访问开销；块大利于部分执行效率却增加浪费。",
+      "evidence": "核读 §3–4、§7 的块尺寸讨论。它优化管理与服务效率，不是自动压缩每个 KV 元素，也不是 DRAM row policy。",
+      "interview": "将“容量利用率改善可容纳更多 batch”与“单条请求变快”分开说明。"
+    },
+    {
+      "id": "sys-paper-gqa",
+      "title": "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints",
+      "year": 2023,
+      "venue": "EMNLP",
+      "url": "https://aclanthology.org/2023.emnlp-main.298.pdf",
+      "sourceId": "sys15",
+      "modules": [
+        "architecture-case"
+      ],
+      "problem": "多头 attention 的 K/V 状态和 decode 读取有显著容量与带宽代价。",
+      "mechanism": "多个 query head 分组共享较少 K/V head，在 MHA 与 MQA 之间选择结构。",
+      "tradeoff": "KV 减少需要结合模型质量、训练/适配与 kernel 实现评估，不是存储控制器能独自改变的开关。",
+      "evidence": "核读 §2 的 head 分组与端点定义；容量推导使用 Hkv 而非 Hquery。",
+      "interview": "现场写出 2×层数×batch×长度×KV heads×head dim×字节数，解释每个因子。"
+    },
+    {
+      "id": "sys-paper-flexgen",
+      "title": "FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU",
+      "year": 2023,
+      "venue": "ICML",
+      "url": "https://arxiv.org/pdf/2303.06865",
+      "sourceId": "sys16",
+      "modules": [
+        "architecture-case",
+        "interview-lab"
+      ],
+      "problem": "GPU 容量有限，大模型需要把数据分布在更慢、更大的层级中。",
+      "mechanism": "联合选择张量放置与层/批次执行顺序，并将未来数据传输与当前计算重叠。",
+      "tradeoff": "以可接受更长延迟的离线吞吐为目标；更大 batch、更多搬运和复杂调度未必满足在线 p99。",
+      "evidence": "核读 §4 放置、遍历和重叠。该论文研究 GPU/CPU/磁盘，不是 HBF 器件或系统实测。",
+      "interview": "借其思路设计 HBM/HBF 模型，同时明确新介质的延迟、粒度、写入和封装约束必须另行校准。"
+    }
+  ]
+}
